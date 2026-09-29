@@ -6,6 +6,7 @@ import { zipSync, unzipSync } from "fflate";
 
 const baseFiles = ["manifest.json", "background.js", "content.js", "popup.html", "popup.css", "popup.js"];
 
+/** Reject paths that can escape the extension or refer to remote resources. */
 function localPath(value) {
   assert.equal(typeof value, "string", "ファイルパスは文字列で指定してください");
   assert(value && !value.includes("\\") && !value.includes(":") && !value.startsWith("/") &&
@@ -14,6 +15,7 @@ function localPath(value) {
   return value;
 }
 
+/** Collect declared extension assets and reject missing or unlisted dependencies. */
 export async function collectFiles(root) {
   const manifest = JSON.parse(await readFile(path.join(root, "manifest.json"), "utf8"));
   assert.equal(manifest.manifest_version, 3, "Manifest V3が必要です");
@@ -31,6 +33,16 @@ export async function collectFiles(root) {
   ];
   const names = new Set(baseFiles);
   for (const [, value] of icons) names.add(localPath(value));
+  const pages = [
+    manifest.action?.default_popup,
+    manifest.side_panel?.default_path,
+    manifest.options_page,
+    manifest.options_ui?.page,
+    manifest.devtools_page,
+    ...Object.values(manifest.chrome_url_overrides ?? {}),
+    ...(manifest.sandbox?.pages ?? []),
+  ].filter(Boolean);
+  for (const page of pages) names.add(localPath(page));
   const references = [
     manifest.background?.service_worker,
     manifest.action?.default_popup,
@@ -47,15 +59,25 @@ export async function collectFiles(root) {
       new Script(Buffer.from(files[name]).toString("utf8"), { filename: name });
     }
   }
-  const html = Buffer.from(files["popup.html"]).toString("utf8");
-  for (const match of html.matchAll(/(?:src|href)\s*=\s*["']([^"']+)["']/g)) {
-    assert(names.has(localPath(match[1])), `ポップアップの参照先が配布対象にありません: ${match[1]}`);
-  }
-  const css = Buffer.from(files["popup.css"]).toString("utf8");
-  assert(!/@import\b/i.test(css), "CSSの@importは配布対象を明示してから使用してください");
-  for (const match of css.matchAll(/url\(\s*["']?([^\s"')]+)["']?\s*\)/gi)) {
-    if (match[1].startsWith("data:")) continue;
-    assert(names.has(localPath(match[1])), `CSSの参照先が配布対象にありません: ${match[1]}`);
+  for (const [name, data] of Object.entries(files)) {
+    if (/\.html?$/i.test(name)) {
+      const html = Buffer.from(data).toString("utf8");
+      for (const match of html.matchAll(/(?:src|href)\s*=\s*["']([^"']+)["']/g)) {
+        assert(!match[1].startsWith("/"), `絶対パスは使えません: ${match[1]}`);
+        const reference = localPath(path.posix.join(path.posix.dirname(name), match[1]));
+        assert(names.has(reference), `${name}の参照先が配布対象にありません: ${reference}`);
+      }
+    }
+    if (name.endsWith(".css")) {
+      const css = Buffer.from(data).toString("utf8");
+      assert(!/@import\b/i.test(css), "CSSの@importは配布対象を明示してから使用してください");
+      for (const match of css.matchAll(/url\(\s*["']?([^\s"')]+)["']?\s*\)/gi)) {
+        if (match[1].startsWith("data:")) continue;
+        assert(!match[1].startsWith("/"), `絶対パスは使えません: ${match[1]}`);
+        const reference = localPath(path.posix.join(path.posix.dirname(name), match[1]));
+        assert(names.has(reference), `CSSの参照先が配布対象にありません: ${reference}`);
+      }
+    }
   }
   for (const [size, name] of icons) {
     const data = Buffer.from(files[name]);
@@ -69,9 +91,11 @@ export async function collectFiles(root) {
   return { manifest, files };
 }
 
+/** Create and round-trip verify a deterministic ZIP, independent of host timezone. */
 export function createArchive(files) {
-  // 同じ入力から同じZIPを作れるよう、エントリの日時を固定する。
-  const entries = Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b))
+  // fflateのDOS日時はローカル年月日時を使うため、壁時計時刻を固定する。
+  // Date.UTCにすると各TZでgetHours()等が変わり、かえってZIPに差が出る。
+  const entries = Object.fromEntries(Object.entries(files).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
     .map(([name, data]) => [name, [data, { mtime: new Date(2000, 0, 1) }]]));
   const zip = zipSync(entries, { level: 9 });
   const unpacked = unzipSync(zip);

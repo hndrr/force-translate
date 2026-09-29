@@ -33,26 +33,14 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: node scripts/prepare-release.mjs
       - run: npm ci --ignore-scripts
-        if: steps.release.outputs.exists == 'false'
       - run: npm test
-        if: steps.release.outputs.exists == 'false'
       - run: npm run package
-        if: steps.release.outputs.exists == 'false'
       - name: Publish GitHub Release
-        if: steps.release.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_COMMIT: ${{ github.sha }}
-        run: |
-          gh release create "$RELEASE_TAG" \
-            dist/force-translate-*.zip \
-            dist/force-translate-*.zip.sha256 \
-            dist/release-checklist.md \
-            --target "$RELEASE_COMMIT" \
-            --title "Force Translate $RELEASE_TAG" \
-            --generate-notes
+        run: node scripts/publish-release.mjs
       - name: Show packaging report
-        if: steps.release.outputs.exists == 'false'
         run: cat dist/release-checklist.md >> "$GITHUB_STEP_SUMMARY"

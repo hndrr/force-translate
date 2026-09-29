@@ -64,11 +64,12 @@ test("自動採番をZIP内のmanifestにも反映する", async (t) => {
   assert.equal(zipManifest.version, "0.5.1");
 });
 
-test("公開済みの同じコミットはスキップし、タグだけなら同じ番号で再開する", async (t) => {
+test("公開済みでも添付ファイル再検証用に採番し、タグだけなら同じ番号で再開する", async (t) => {
   const root = await fixture(t);
   const input = { root, tags: [tag("v0.5.1", "current")], commit: "current" };
-  const done = await prepareRelease({ ...input, getRelease: async () => ({ draft: false }) });
+  const done = await prepareRelease({ ...input, getRelease: async () => ({ tag_name: "v0.5.1", draft: false }) });
   assert.equal(done.exists, true);
+  assert.equal(JSON.parse(await readFile(path.join(root, "manifest.json"), "utf8")).version, "0.5.1");
   const resumed = await prepareRelease({ ...input, getRelease: async () => null });
   assert.equal(resumed.exists, false);
   assert.equal(resumed.version, "0.5.1");
@@ -79,6 +80,18 @@ test("APIエラーや採番の競合があればmanifestを書き換えず停止
   const before = await readFile(path.join(root, "manifest.json"), "utf8");
   const input = { root, tags: [tag("v0.5.0")], commit: "current" };
   await assert.rejects(prepareRelease({ ...input, getRelease: async () => { throw new Error("HTTP 403"); } }), /403/);
-  await assert.rejects(prepareRelease({ ...input, getRelease: async () => ({ draft: false }) }), /採番中/);
+  await assert.rejects(prepareRelease({ ...input, getRelease: async () => ({ tag_name: "v0.5.1", draft: false }) }), /採番中/);
   assert.equal(await readFile(path.join(root, "manifest.json"), "utf8"), before);
+});
+
+test("タグ作成前のdraftは同じSHAだけ再開し、別コミットのdraftを拒否する", async (t) => {
+  const root = await fixture(t);
+  const input = { root, tags: [], commit: "current" };
+  const draft = { tag_name: "v0.5.0", draft: true, target_commitish: "current" };
+  const result = await prepareRelease({ ...input, getRelease: async () => draft });
+  assert.equal(result.tag, "v0.5.0");
+  assert.equal(result.exists, true);
+  await assert.rejects(prepareRelease({ ...input,
+    getRelease: async () => ({ ...draft, target_commitish: "other" }),
+  }), /コミットが一致しません/);
 });
