@@ -12,7 +12,8 @@ const files = {
 
 /** Simulate remote state so interrupted uploads persist between attempts. */
 function fixture({ draft = true, target = commit, tagCommit = commit, present = {}, absent = false } = {}) {
-  let release = absent ? null : { tag_name: tag, target_commitish: target, draft, assets: [] };
+  const releaseId = 42;
+  let release = absent ? null : { id: releaseId, tag_name: tag, target_commitish: target, draft, assets: [] };
   const bytes = new Map();
   const events = [];
   let nextId = 1;
@@ -25,17 +26,42 @@ function fixture({ draft = true, target = commit, tagCommit = commit, present = 
   for (const [name, data] of Object.entries(present)) put(name, data);
   const api = {
     getRelease: async () => structuredClone(release),
+    getReleaseById: async (id) => {
+      assert.equal(id, releaseId);
+      return structuredClone(release);
+    },
     getTagCommit: async () => tagCommit,
     getAssetBytes: async (asset) => bytes.get(asset.id),
     createDraft: async () => {
       events.push("create");
-      release = { tag_name: tag, target_commitish: commit, draft: true, assets: [] };
+      release = { id: releaseId, tag_name: tag, target_commitish: commit, draft: true, assets: [] };
+      return structuredClone(release);
     },
     uploadAsset: async (_tag, name) => { events.push(`upload:${name}`); put(name, files[name]); },
-    publishDraft: async () => { events.push("publish"); release.draft = false; tagCommit = commit; },
+    publishDraft: async (id) => {
+      assert.equal(id, releaseId);
+      events.push("publish");
+      release.draft = false;
+      tagCommit = commit;
+    },
   };
   return { api, events, put };
 }
+
+test("作成直後のdraftがタグ検索・一覧にまだ現れなくても公開できる", async () => {
+  const { api, events } = fixture({ absent: true, tagCommit: null });
+  api.getRelease = async () => null;
+  assert.equal(await publishRelease({ tag, commit, files, api }), "published");
+  assert.deepEqual(events, ["create", ...Object.keys(files).map((name) => `upload:${name}`), "publish"]);
+});
+
+test("再開したdraftの検索結果が古くてもIDで添付ファイルと公開状態を再検証する", async () => {
+  const { api, events } = fixture();
+  const stale = await api.getRelease(tag);
+  api.getRelease = async () => structuredClone(stale);
+  assert.equal(await publishRelease({ tag, commit, files, api }), "published");
+  assert.deepEqual(events, [...Object.keys(files).map((name) => `upload:${name}`), "publish"]);
+});
 
 test("アップロード中断後の再実行で一致するファイルを保ち、不足分だけを追加して公開する", async () => {
   const { api, events } = fixture({ absent: true, tagCommit: null });
