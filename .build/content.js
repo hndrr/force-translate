@@ -8,6 +8,11 @@ var ForceTranslateContent;
     const BATCH_SIZE = 20;
     const MUTATION_DEBOUNCE_MS = 180;
     const SHADOW_SCAN_INTERVAL_MS = 1800;
+    // UI・本文・リンクプレビューはそれぞれ別の言語になり得る。
+    // プレビューは本文の外にあるarticle単位で扱い、ハッシュ付きclass名には依存しない。
+    const DISCORD_EMBED_SELECTOR = '[id^="message-accessories-"] article';
+    const DISCORD_CONTENT_SELECTOR = `[id^="message-content-"], ${DISCORD_EMBED_SELECTOR}`;
+    const isDiscord = /^(?:(?:canary|ptb)\.)?discord(?:app)?\.com$/i.test(location.hostname);
     const SUPPORTED_LANGUAGES = new Set([
         "ar", "bg", "bn", "cs", "da", "de", "el", "en", "es", "fi", "fr",
         "he", "hi", "hr", "hu", "id", "it", "ja", "kn", "ko", "lt", "mr",
@@ -40,6 +45,8 @@ var ForceTranslateContent;
     const pendingRoots = new Set();
     const translationCache = new Map();
     const translatorPromises = new Map();
+    const contentLanguageCache = new WeakMap();
+    const knownContentLanguages = new Set();
     let active = false;
     let runVersion = 0;
     let sourceLanguageCache;
@@ -248,6 +255,9 @@ var ForceTranslateContent;
         const parent = textNode.parentElement;
         if (!parent)
             return true;
+        // カード内の画像エラーなどはDiscordのUI。言語判定にも混ぜない。
+        if (isDiscord && parent.closest(DISCORD_EMBED_SELECTOR) && parent.closest("button, [role='button']"))
+            return true;
         return Boolean(parent.closest(EXCLUDED_SELECTOR));
     }
     function collectTextNodes(root) {
@@ -279,12 +289,19 @@ var ForceTranslateContent;
             return true;
         });
     }
-    function buildLanguageSample() {
+    function originalText(node) {
+        const record = translations.get(node);
+        return record && node.data === record.translated ? record.original : node.data;
+    }
+    function discordContent(node) {
+        return isDiscord ? node.parentElement?.closest(DISCORD_CONTENT_SELECTOR) ?? null : null;
+    }
+    function buildLanguageSample(root = document.body ?? document.documentElement, minimumLength = 8) {
         const parts = [];
         let length = 0;
-        for (const node of collectTextNodes(document.body ?? document.documentElement)) {
-            const text = node.data.trim();
-            if (text.length < 8)
+        for (const node of collectTextNodes(root)) {
+            const text = originalText(node).trim();
+            if (text.length < minimumLength)
                 continue;
             parts.push(text);
             length += text.length;
@@ -293,11 +310,11 @@ var ForceTranslateContent;
         }
         return parts.join("\n").slice(0, MAX_SAMPLE_LENGTH);
     }
-    async function resolveSourceLanguage() {
+    async function resolvePageSourceLanguage() {
         if (sourceLanguageCache !== undefined)
             return sourceLanguageCache;
         const declared = normalizeLanguage(document.documentElement.lang);
-        if (declared && declared !== TARGET_LANGUAGE) {
+        if (declared && (isDiscord || declared !== TARGET_LANGUAGE)) {
             sourceLanguageCache = declared;
             return declared;
         }
@@ -305,42 +322,95 @@ var ForceTranslateContent;
         sourceLanguageCache = detected;
         return detected;
     }
+    function resolveContentLanguage(content) {
+        const sample = buildLanguageSample(content, 1);
+        const cached = contentLanguageCache.get(content);
+        if (cached?.sample === sample)
+            return cached.language;
+        const language = detectLanguage(sample).then((detected) => {
+            // 短い英語（Hi / Thanks等）はChromeがundを返す場合がある。
+            // 日本語など別の文字体系を含む投稿には英語の補完を適用しない。
+            const letters = sample.match(/\p{L}/gu)?.join("") ?? "";
+            const source = detected ?? (/^[a-z]+$/i.test(letters) ? "en" : null);
+            if (source && source !== TARGET_LANGUAGE)
+                knownContentLanguages.add(source);
+            return source;
+        });
+        contentLanguageCache.set(content, { sample, language });
+        return language;
+    }
+    async function resolveSourceLanguages() {
+        const contentLanguages = isDiscord
+            ? await Promise.all([...document.querySelectorAll(DISCORD_CONTENT_SELECTOR)].map(resolveContentLanguage))
+            : [];
+        const languages = [...contentLanguages, await resolvePageSourceLanguage()];
+        return [...new Set(languages.filter((language) => Boolean(language) && language !== TARGET_LANGUAGE))];
+    }
     async function translateNodes(nodes, version) {
         if (!nodes.length || !active || version !== runVersion)
             return;
-        const sourceLanguage = await resolveSourceLanguage();
-        if (!sourceLanguage || sourceLanguage === TARGET_LANGUAGE)
-            return;
-        const candidates = [];
+        const groups = new Map();
         for (const node of nodes) {
             if (!node.isConnected || shouldSkipText(node))
                 continue;
-            const original = node.data;
-            if (!original.trim())
+            if (node.data === translations.get(node)?.translated)
                 continue;
-            candidates.push({ node, original });
+            const original = node.data;
+            const content = discordContent(node);
+            const group = groups.get(content) ?? [];
+            group.push({ node, original });
+            groups.set(content, group);
         }
-        for (let offset = 0; offset < candidates.length; offset += BATCH_SIZE) {
-            if (!active || version !== runVersion)
-                return;
-            const batch = candidates.slice(offset, offset + BATCH_SIZE);
-            const translated = await translateBatch(sourceLanguage, batch.map((item) => item.original));
-            translated.forEach((value, index) => {
-                const item = batch[index];
-                if (!item || !item.node.isConnected || item.node.data !== item.original)
-                    return;
-                if (value === item.original)
-                    return;
-                // 記録を先に置いてからnode.dataだけを書き換える。
-                // 要素の追加・ラップ・replaceWith等は一切しない。
-                translations.set(item.node, {
-                    original: item.original,
-                    translated: value,
-                    version,
-                });
-                item.node.data = value;
-            });
+        const resolved = await Promise.all([...groups].map(async ([content, candidates]) => ({
+            sourceLanguage: await (content ? resolveContentLanguage(content) : resolvePageSourceLanguage()),
+            candidates,
+        })));
+        const byLanguage = new Map();
+        for (const { sourceLanguage, candidates } of resolved) {
+            if (!sourceLanguage || sourceLanguage === TARGET_LANGUAGE)
+                continue;
+            const group = byLanguage.get(sourceLanguage) ?? [];
+            group.push(...candidates);
+            byLanguage.set(sourceLanguage, group);
         }
+        let firstError;
+        for (const [sourceLanguage, candidates] of byLanguage) {
+            try {
+                for (let offset = 0; offset < candidates.length; offset += BATCH_SIZE) {
+                    if (!active || version !== runVersion)
+                        return;
+                    const batch = candidates.slice(offset, offset + BATCH_SIZE).filter(({ node, original }) => node.isConnected && node.data === original && !shouldSkipText(node) &&
+                        node.data !== translations.get(node)?.translated);
+                    if (!batch.length)
+                        continue;
+                    const translated = await translateBatch(sourceLanguage, batch.map((item) => item.original));
+                    // 停止・再開中に終わった古い翻訳をDOMへ反映しない。
+                    if (!active || version !== runVersion)
+                        return;
+                    translated.forEach((value, index) => {
+                        const item = batch[index];
+                        if (!item || !item.node.isConnected || item.node.data !== item.original || shouldSkipText(item.node))
+                            return;
+                        if (value === item.original)
+                            return;
+                        // 記録を先に置いてからnode.dataだけを書き換える。
+                        // 要素の追加・ラップ・replaceWith等は一切しない。
+                        translations.set(item.node, {
+                            original: item.original,
+                            translated: value,
+                            version,
+                        });
+                        item.node.data = value;
+                    });
+                }
+            }
+            catch (error) {
+                // ある言語のモデルが未準備でも、他の言語の投稿は処理する。
+                firstError ??= error;
+            }
+        }
+        if (firstError)
+            throw firstError;
     }
     const mutationObserver = new MutationObserver((mutations) => {
         if (!active)
@@ -358,8 +428,9 @@ var ForceTranslateContent;
             // ReactがtextContent/innerHTML等でTextNodeごと差し替えた場合。
             mutation.addedNodes.forEach((node) => pendingRoots.add(node));
         }
-        if (mutationTimer !== null)
-            window.clearTimeout(mutationTimer);
+        // 更新が続くチャットでも処理を先送りし続けない。自分の変更だけなら予約しない。
+        if (!pendingRoots.size || mutationTimer !== null)
+            return;
         mutationTimer = window.setTimeout(() => {
             mutationTimer = null;
             if (!active)
@@ -467,12 +538,14 @@ var ForceTranslateContent;
         if (!isTopFrame || event.button !== 2 || !("Translator" in globalThis))
             return;
         const declared = normalizeLanguage(document.documentElement.lang);
-        const source = sourceLanguageCache ?? declared;
-        if (!source || source === TARGET_LANGUAGE || translatorPromises.has(source))
-            return;
-        void createTranslatorFromGesture(source).catch((error) => {
-            console.warn("[Force Translate] translator prewarm failed", error);
-        });
+        const sources = new Set([...knownContentLanguages, sourceLanguageCache ?? declared]);
+        for (const source of sources) {
+            if (!source || source === TARGET_LANGUAGE || translatorPromises.has(source))
+                continue;
+            void createTranslatorFromGesture(source).catch((error) => {
+                console.warn("[Force Translate] translator prewarm failed", error);
+            });
+        }
     }
     async function maybeStartAutoTranslate() {
         if (!isTopFrame)
@@ -501,12 +574,13 @@ var ForceTranslateContent;
             return;
         }
         if (rawMessage.type === "FT_GET_STATUS" && isTopFrame) {
-            void resolveSourceLanguage()
-                .then((sourceLanguage) => {
+            void resolveSourceLanguages()
+                .then(async (sourceLanguages) => {
                 sendResponse({
                     ok: true,
                     active,
-                    sourceLanguage,
+                    sourceLanguage: sourceLanguages[0] ?? await resolvePageSourceLanguage(),
+                    sourceLanguages,
                     origin: pageOrigin(),
                 });
             })
@@ -515,6 +589,7 @@ var ForceTranslateContent;
                     ok: true,
                     active,
                     sourceLanguage: null,
+                    sourceLanguages: [],
                     origin: pageOrigin(),
                 });
             });
@@ -545,6 +620,6 @@ var ForceTranslateContent;
         window.addEventListener("contextmenu", prewarmTranslatorFromGesture, true);
     }
     // 右クリック前に言語だけ解決しておくと、user gesture中にTranslator.create()を即開始できる。
-    void resolveSourceLanguage().catch(() => undefined);
+    void resolveSourceLanguages().catch(() => undefined);
     void maybeStartAutoTranslate().catch(notifyError);
 })(ForceTranslateContent || (ForceTranslateContent = {}));
