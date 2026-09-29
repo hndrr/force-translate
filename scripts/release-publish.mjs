@@ -41,10 +41,12 @@ export async function publishRelease({ tag, commit, files, api }) {
   if (!release) {
     const tagCommit = await api.getTagCommit(tag);
     assert(tagCommit === null || tagCommit === commit, "タグが別のコミットを指しています");
-    await api.createDraft(tag, commit);
-    release = await api.getRelease(tag);
+    // Creation returns the draft before tag lookup or the release list may see it.
+    release = await api.createDraft(tag, commit);
   }
   assert(release, "Releaseが見つかりません");
+  const releaseId = release.id;
+  assert(Number.isSafeInteger(releaseId) && releaseId > 0, "Release IDが不正です");
   await checkTarget(api, release, tag, commit);
   const pending = await inspectAssets(api, release, files);
   if (!release.draft) {
@@ -52,12 +54,12 @@ export async function publishRelease({ tag, commit, files, api }) {
     return "verified";
   }
   for (const name of pending) await api.uploadAsset(tag, name);
-  release = await api.getRelease(tag);
+  release = await api.getReleaseById(releaseId);
   assert(release?.draft, "検証中にReleaseの公開状態が変更されました");
   await checkTarget(api, release, tag, commit);
   assert.equal((await inspectAssets(api, release, files)).length, 0, "添付ファイルの再検証に失敗しました");
-  await api.publishDraft(tag);
-  release = await api.getRelease(tag);
+  await api.publishDraft(releaseId);
+  release = await api.getReleaseById(releaseId);
   assert(release && !release.draft, "Releaseを公開できませんでした");
   await checkTarget(api, release, tag, commit);
   assert.equal((await inspectAssets(api, release, files)).length, 0, "公開後の添付ファイル検証に失敗しました");
