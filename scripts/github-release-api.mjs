@@ -3,12 +3,16 @@ export function createGitHubClient({ apiUrl, repo, token, fetchImpl = fetch }) {
   const base = `${apiUrl}/repos/${repo}`;
 
   /** Only an explicit 404 is absence; propagate permission and network errors. */
-  async function request(endpoint, { binary = false, optional = false } = {}) {
+  async function request(endpoint, { binary = false, optional = false, method = "GET", body } = {}) {
     const response = await fetchImpl(`${base}/${endpoint}`, {
+      method,
+      cache: "no-store",
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: binary ? "application/octet-stream" : "application/vnd.github+json",
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
       },
+      body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (optional && response.status === 404) return null;
     if (!response.ok) throw new Error(`GitHub API: HTTP ${response.status} (${endpoint})`);
@@ -26,5 +30,17 @@ export function createGitHubClient({ apiUrl, repo, token, fetchImpl = fetch }) {
       if (releases.length < 100) return null;
     }
   }
-  return { request, getRelease };
+  return {
+    request,
+    getRelease,
+    getReleaseById: (id) => request(`releases/${id}`),
+    createDraft: (tag, commit) => request("releases", { method: "POST", body: {
+      tag_name: tag,
+      target_commitish: commit,
+      name: `Force Translate ${tag}`,
+      draft: true,
+      generate_release_notes: true,
+    } }),
+    publishDraft: (id) => request(`releases/${id}`, { method: "PATCH", body: { draft: false } }),
+  };
 }
