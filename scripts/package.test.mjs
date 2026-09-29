@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -83,3 +84,34 @@ test("拡張アイコンとツールバーアイコンを両方含め、寸法�
   await writeFile(path.join(root, "manifest.json"), JSON.stringify(manifest));
   await assert.rejects(collectFiles(root), /寸法が128x128ではありません/);
 });
+
+test("ZIPのバイト列がUTC・東京・ロサンゼルスで一致する", () => {
+  const moduleURL = new URL("./package-lib.mjs", import.meta.url).href;
+  const script = `import { createArchive } from ${JSON.stringify(moduleURL)};
+    process.stdout.write(createArchive({"a.txt": new TextEncoder().encode("same payload")}));`;
+  const archives = ["UTC", "Asia/Tokyo", "America/Los_Angeles"].map((TZ) =>
+    execFileSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, TZ } }));
+  for (const zip of archives.slice(1)) assert.deepEqual(zip, archives[0]);
+});
+
+for (const [label, fields] of [
+  ["side_panel", { side_panel: { default_path: "pages/settings.html" } }],
+  ["options_page", { options_page: "pages/settings.html" }],
+  ["options_ui", { options_ui: { page: "pages/settings.html" } }],
+  ["devtools_page", { devtools_page: "pages/settings.html" }],
+  ["chrome_url_overrides", { chrome_url_overrides: { newtab: "pages/settings.html" } }],
+  ["sandbox", { sandbox: { pages: ["pages/settings.html"] } }],
+]) {
+  test(`${label}のページを同梱し、ページや依存ファイルの欠落を検出する`, async (t) => {
+    const { root, manifest } = await fixture(t);
+    await writeFile(path.join(root, "manifest.json"), JSON.stringify({ ...manifest, ...fields }));
+    await assert.rejects(collectFiles(root), { code: "ENOENT" });
+    await mkdir(path.join(root, "pages"));
+    const pagePath = path.join(root, "pages/settings.html");
+    await writeFile(pagePath, '<script src="../popup.js"></script>');
+    const { files } = await collectFiles(root);
+    assert.deepEqual(Buffer.from(unzipSync(createArchive(files))["pages/settings.html"]), await readFile(pagePath));
+    await writeFile(pagePath, '<script src="missing.js"></script>');
+    await assert.rejects(collectFiles(root), /参照先が配布対象にありません/);
+  });
+}

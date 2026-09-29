@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 export const projectRoot = fileURLToPath(new URL("../", import.meta.url));
 export const scriptFiles = ["background.js", "content.js", "popup.js"];
 
+/** Compile in a temporary directory before updating the extension's scripts. */
 export async function build() {
   const output = await mkdtemp(path.join(tmpdir(), "force-translate-build-"));
   try {
