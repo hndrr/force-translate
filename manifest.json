@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Force Translate",
+  "version": "0.5.0",
+  "minimum_chrome_version": "138",
+  "description": "translate=\"no\" を無視し、ReactのDOM構造を変えずTextNodeだけをChrome内蔵Translator APIで日本語化します。",
+  "permissions": [
+    "contextMenus",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Force Translate",
+    "default_popup": "popup.html"
+  },
+  "commands": {
+    "toggle-translation": {
+      "suggested_key": {
+        "default": "Alt+Shift+T",
+        "mac": "Alt+Shift+T"
+      },
+      "description": "このページの翻訳を切り替える"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
+    }
+  ]
+}
