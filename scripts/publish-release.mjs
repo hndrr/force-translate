@@ -20,13 +20,16 @@ for (const name of [zipName, `${zipName}.sha256`, "release-checklist.md"]) {
 }
 assert.equal(files[`${zipName}.sha256`].toString().trim(),
   `${createHash("sha256").update(files[zipName]).digest("hex")}  ${zipName}`, "ZIPのチェックサムが一致しません");
-const { request, getRelease } = createGitHubClient({
+const { request, getRelease, getReleaseById, createDraft, publishDraft } = createGitHubClient({
   apiUrl: process.env.GITHUB_API_URL, repo: process.env.GH_REPO, token: process.env.GH_TOKEN,
 });
 
 const gh = (...args) => execFileSync("gh", args, { stdio: "inherit" });
 const result = await publishRelease({ tag, commit, files, api: {
   getRelease,
+  getReleaseById,
+  createDraft,
+  publishDraft,
   async getTagCommit(name) {
     const ref = await request(`git/ref/tags/${encodeURIComponent(name)}`, { optional: true });
     if (!ref) return null;
@@ -39,9 +42,6 @@ const result = await publishRelease({ tag, commit, files, api: {
     return object.sha;
   },
   getAssetBytes: (asset) => request(`releases/assets/${asset.id}`, { binary: true }),
-  createDraft: (name, sha) => gh("release", "create", name, "--draft", "--target", sha,
-    "--title", `Force Translate ${name}`, "--generate-notes"),
   uploadAsset: (name, file) => gh("release", "upload", name, path.join("dist", file), "--clobber"),
-  publishDraft: (name) => gh("release", "edit", name, "--draft=false"),
 } });
 console.log(result === "verified" ? `${tag}: 公開済みのコミットと全添付ファイルが一致しました` : `${tag}: 検証済みの添付ファイルを公開しました`);

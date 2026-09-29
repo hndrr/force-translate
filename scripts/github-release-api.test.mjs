@@ -31,3 +31,39 @@ test("権限エラーをRelease未作成として扱わない", async () => {
   });
   await assert.rejects(getRelease("v0.5.1"), /HTTP 403/);
 });
+
+test("draft作成レスポンスのIDで取得・公開でき、検索の反映を待たない", async () => {
+  let release = null;
+  const base = "https://api.example.test/repos/test/repo";
+  const client = createGitHubClient({ apiUrl: "https://api.example.test", repo: "test/repo", token: "fake",
+    async fetchImpl(url, options) {
+      assert.equal(options.cache, "no-store");
+      if (url === `${base}/releases` && options.method === "POST") {
+        assert.equal(options.headers["Content-Type"], "application/json");
+        assert.deepEqual(JSON.parse(options.body), {
+          tag_name: "v0.5.1", target_commitish: "commit", name: "Force Translate v0.5.1",
+          draft: true, generate_release_notes: true,
+        });
+        release = { id: 42, tag_name: "v0.5.1", target_commitish: "commit", draft: true, assets: [] };
+        return Response.json(release, { status: 201 });
+      }
+      if (url === `${base}/releases/42`) {
+        if (options.method === "PATCH") {
+          assert.deepEqual(JSON.parse(options.body), { draft: false });
+          release.draft = false;
+        } else {
+          assert.equal(options.method, "GET");
+        }
+        return Response.json(release);
+      }
+      if (url === `${base}/releases/tags/v0.5.1`) return new Response("", { status: 404 });
+      assert.equal(url, `${base}/releases?per_page=100&page=1`);
+      return Response.json([]);
+    },
+  });
+  const draft = await client.createDraft("v0.5.1", "commit");
+  assert.equal(await client.getRelease("v0.5.1"), null);
+  assert.deepEqual(await client.getReleaseById(draft.id), draft);
+  assert.equal((await client.publishDraft(draft.id)).draft, false);
+  assert.equal((await client.getReleaseById(draft.id)).draft, false);
+});
