@@ -1,0 +1,18 @@
+{
+  "name": "force-translate",
+  "private": true,
+  "description": "Chrome内蔵Translator APIを使ったページ翻訳拡張",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json --noEmit",
+    "build": "node scripts/build.mjs",
+    "package": "node scripts/package.mjs",
+    "test": "node --test scripts/*.test.mjs"
+  },
+  "devDependencies": {
+    "fflate": "0.8.3",
+    "typescript": "6.0.3"
+  }
+}
