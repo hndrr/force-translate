@@ -5,7 +5,7 @@
 ブランチへのpush・Pull Request・手動実行で、`Package extension`ワークフローが次を実行します。
 
 1. `npm ci`で固定バージョンの開発用依存関係をインストール
-2. パッケージ処理のテスト
+2. 翻訳・ポップアップ・パッケージ処理のテスト
 3. TypeScriptの型チェックとビルド
 4. 配布対象ファイルの参照先・JavaScript構文・ZIP内容を検証
 5. 配布用ZIPと確認レポートをActionsの成果物に保存（30日間）
@@ -68,7 +68,8 @@ npm run package
 ZIPには実行用ファイルだけを含め、TypeScriptソース、開発用依存関係、文書、秘密鍵は含めません。
 同じ入力から同じ内容のZIPを生成します。
 
-開発中は`npm run check`で型チェック、`npm run build`でJavaScriptの生成、`npm test`でパッケージ処理のテストを実行できます。
+開発中は`npm run check`で型チェック、`npm run build`でJavaScriptの生成、`npm test`で翻訳・ポップアップ・パッケージ処理のテストを実行できます。
+翻訳の回帰テストはjsdom上でDiscordの投稿・リンクプレビューの構造とDOM更新を再現し、Chromeの言語判定・翻訳APIをスタブに置き換えます。実際のモデルの翻訳品質やChromeでのモデル取得は実機確認が必要です。
 `build.sh`も`npm run build`を呼び出します。
 
 ## 公開用の準備
