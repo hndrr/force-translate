@@ -26,7 +26,7 @@ function languageOf(text) {
   return "en";
 }
 
-function fixture(t, { html = "", lang = "ja", url = "https://discord.com/channels/server/channel", detect = languageOf, translate, availability } = {}) {
+function fixture(t, { html = "", lang = "ja", url = "https://discord.com/channels/server/channel", detect = languageOf, translate, availability, create } = {}) {
   const dom = new JSDOM(`<!doctype html><html lang="${lang}" translate="no"><body>${html}</body></html>`, {
     url, runScripts: "outside-only",
   });
@@ -54,10 +54,13 @@ function fixture(t, { html = "", lang = "ja", url = "https://discord.com/channel
       availabilityChecks.push(sourceLanguage);
       return availability?.(sourceLanguage) ?? "available";
     },
-    create: async ({ sourceLanguage }) => ({ translate: async (text) => {
-      calls.push({ language: sourceLanguage, text });
-      return translate ? translate(text, sourceLanguage) : `翻訳(${sourceLanguage}):${text}`;
-    } }),
+    create: async ({ sourceLanguage }) => {
+      await create?.(sourceLanguage);
+      return { translate: async (text) => {
+        calls.push({ language: sourceLanguage, text });
+        return translate ? translate(text, sourceLanguage) : `翻訳(${sourceLanguage}):${text}`;
+      } };
+    },
   };
   window.console.error = (...args) => errors.push(args);
   window.alert = (message) => alerts.push(message);
@@ -211,6 +214,124 @@ test("読み込み前に開始しても、新着・編集・TextNode交換・チ
   f.stop();
   assert.equal(next.textContent, "Bonjour tout le monde!");
 });
+
+test("過去ログで既存の要素が本文・プレビューに切り替わっても翻訳する", async (t) => {
+  const f = fixture(t, { html: '<main><div id="placeholder">An older message.</div><div id="accessories"><article>A historical link preview.</article></div></main>' });
+  f.start();
+  await delay(230);
+  assert.equal(f.calls.length, 0);
+  const message = f.document.getElementById("placeholder");
+  const accessories = f.document.getElementById("accessories");
+  message.id = "message-content-old";
+  accessories.id = "message-accessories-old";
+  await waitFor(() => message.textContent === "翻訳(en):An older message." && accessories.textContent === "翻訳(en):A historical link preview.");
+  f.stop();
+  assert.equal(message.textContent, "An older message.");
+  assert.equal(accessories.textContent, "A historical link preview.");
+});
+
+test("スクロールで削除されたコメントの待ち処理を捨て、表示された過去ログを翻訳する", async (t) => {
+  let complete;
+  const f = fixture(t, { html: '<main><div id="message-content-1">The first message.</div><div id="message-content-2">A message removed by scrolling.</div></main>',
+    translate: (text) => {
+      if (text === "The first message.") return new Promise((resolve) => { complete = resolve; });
+      if (text === "A message removed by scrolling.") return new Promise(() => {});
+      return `翻訳:${text}`;
+    } });
+  f.start();
+  await waitFor(() => complete);
+  f.document.getElementById("message-content-2").remove();
+  const history = f.document.createElement("div");
+  history.id = "message-content-old";
+  history.textContent = "An older message loaded by scrolling.";
+  f.document.querySelector("main").prepend(history);
+  await delay(230);
+  complete("最初のメッセージ");
+  await waitFor(() => history.textContent === "翻訳:An older message loaded by scrolling.");
+  assert.ok(!f.calls.some(({ text }) => text === "A message removed by scrolling."));
+  f.stop();
+  assert.equal(history.textContent, "An older message loaded by scrolling.");
+});
+
+test("一時的な翻訳エラーの後も、本文を変更せずスクロールだけで再開する", async (t) => {
+  let failed = false;
+  const f = fixture(t, { html: '<main><div id="message-content-old">An older message.</div></main>',
+    translate: (text) => {
+      if (!failed) { failed = true; throw new Error("Temporary translation error"); }
+      return `翻訳:${text}`;
+    } });
+  f.start();
+  await waitFor(() => f.errors.length === 1);
+  f.document.querySelector("main").dispatchEvent(new f.window.Event("scroll"));
+  await waitFor(() => f.document.getElementById("message-content-old").textContent === "翻訳:An older message.");
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.alerts.length, 0);
+});
+
+test("スクロールで外れた翻訳済み要素を再利用しても、追加の文章を元の言語で翻訳・復元する", async (t) => {
+  const f = fixture(t, { html: '<main><div id="message-content-old"><span>An older message.</span></div></main>', translate: () => "古いメッセージ" });
+  const main = f.document.querySelector("main");
+  const message = f.document.getElementById("message-content-old");
+  const originalNode = message.querySelector("span").firstChild;
+  f.start();
+  await waitFor(() => message.textContent === "古いメッセージ");
+  message.remove();
+  main.dispatchEvent(new f.window.Event("scroll"));
+  await delay(230);
+  const addition = f.document.createElement("span");
+  addition.textContent = "More historical context.";
+  message.append(addition);
+  main.append(message);
+  await waitFor(() => addition.textContent === "古いメッセージ");
+  assert.equal(message.querySelector("span").firstChild, originalNode);
+  assert.equal(f.calls.length, 2, "再表示した原文にはキャッシュを使う");
+  message.remove();
+  f.stop();
+  main.append(message);
+  assert.equal(message.textContent, "An older message.More historical context.");
+});
+
+test("別の言語のモデル初期化中も準備済みモデルで過去ログを翻訳する", async (t) => {
+  let finishCreation;
+  const f = fixture(t, { html: '<main><div id="message-content-fr">Bonjour tout le monde!</div><div id="message-content-en">An older English message.</div></main>',
+    create: (language) => language === "fr" ? new Promise((resolve) => { finishCreation = resolve; }) : undefined });
+  t.after(() => finishCreation?.());
+  f.start();
+  await waitFor(() => finishCreation);
+  await waitFor(() => f.document.getElementById("message-content-en").textContent === "翻訳(en):An older English message.");
+  assert.equal(f.document.getElementById("message-content-fr").textContent, "Bonjour tout le monde!");
+  finishCreation();
+  await waitFor(() => f.document.getElementById("message-content-fr").textContent.startsWith("翻訳"));
+  assert.equal(f.alerts.length, 0);
+});
+
+for (const initialAvailability of ["downloadable", "downloading", "unavailable"]) {
+  test(`スクロールで${initialAvailability}から準備済みになったモデルを再確認し、保留した過去ログも翻訳する`, async (t) => {
+    let modelReady = false;
+    const f = fixture(t, { html: '<main id="scroller"><div id="message-content-old">An older message.</div><div id="message-accessories-old"><article>A historical link preview.</article></div></main>',
+      availability: () => modelReady ? "available" : initialAvailability });
+    const scroller = f.document.getElementById("scroller");
+    f.start();
+    await waitFor(() => f.errors.length === 1);
+    for (let i = 0; i < 12; i++) scroller.dispatchEvent(new f.window.Event("scroll"));
+    await delay(230);
+    assert.equal(f.calls.length, 0, "スクロールをユーザー操作の認証とみなしてモデルを作成しない");
+    assert.equal(f.availabilityChecks.length, 2, "連続スクロールでモデル確認を繰り返さない");
+    modelReady = true;
+    const now = f.window.Date.now();
+    f.window.Date.now = () => now + 2000;
+    scroller.dispatchEvent(new f.window.Event("scroll"));
+    await waitFor(() => scroller.textContent === "翻訳(en):An older message.翻訳(en):A historical link preview.");
+    assert.deepEqual([...(await f.status()).modelIssues], []);
+    assert.equal(f.errors.length, 1);
+    assert.equal(f.alerts.length, 0);
+    f.stop();
+    scroller.dispatchEvent(new f.window.Event("scroll"));
+    await delay(230);
+    assert.equal(scroller.textContent, "An older message.A historical link preview.");
+    assert.equal(f.calls.length, 2);
+  });
+}
 
 test("短い英語はundでも翻訳し、判定不能の日本語や絵文字は変更しない", async (t) => {
   const f = fixture(t, { html: `

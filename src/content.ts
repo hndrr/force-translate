@@ -6,6 +6,7 @@ namespace ForceTranslateContent {
   const BATCH_SIZE = 20;
   const MUTATION_DEBOUNCE_MS = 180;
   const SHADOW_SCAN_INTERVAL_MS = 1800;
+  const MODEL_RECHECK_INTERVAL_MS = 1800;
   // UI・本文・リンクプレビューはそれぞれ別の言語になり得る。
   // プレビューは本文の外にあるarticle単位で扱い、ハッシュ付きclass名には依存しない。
   const DISCORD_EMBED_SELECTOR = '[id^="message-accessories-"] article';
@@ -78,6 +79,9 @@ namespace ForceTranslateContent {
   let sourceLanguageCache: string | null | undefined;
   let mutationTimer: number | null = null;
   let shadowScanTimer: number | null = null;
+  let discordScrollPending = false;
+  let lastModelRecheckAt = -Infinity;
+  let modelRecheckPromise: Promise<void> | null = null;
   let aiQueue: Promise<void> = Promise.resolve();
   let lastErrorMessage = "";
   let lastErrorAt = 0;
@@ -189,6 +193,28 @@ namespace ForceTranslateContent {
     }
   }
 
+  function recheckPendingModels(version: number): Promise<void> {
+    if (!isTopFrame || !("Translator" in globalThis) || !modelIssues.size) return Promise.resolve();
+    if (modelRecheckPromise) return modelRecheckPromise;
+    if (Date.now() - lastModelRecheckAt < MODEL_RECHECK_INTERVAL_MS) return Promise.resolve();
+    lastModelRecheckAt = Date.now();
+    const promise = Promise.all([...modelIssues].map(async ([sourceLanguage, issue]) => {
+      try {
+        const availability = await Translator.availability({ sourceLanguage, targetLanguage: TARGET_LANGUAGE });
+        if (active && version === runVersion && modelIssues.get(sourceLanguage) === issue && availability === "available") {
+          modelIssues.delete(sourceLanguage);
+        }
+      } catch {
+        // 状態確認の失敗は保留を維持する。スクロールで警告を繰り返さない。
+      }
+    })).then(() => undefined);
+    modelRecheckPromise = promise;
+    void promise.then(() => {
+      if (modelRecheckPromise === promise) modelRecheckPromise = null;
+    });
+    return promise;
+  }
+
   async function detectLanguage(sample: string): Promise<string | null> {
     const clean = sample.trim().slice(0, MAX_SAMPLE_LENGTH);
     if (!clean) return null;
@@ -229,6 +255,7 @@ namespace ForceTranslateContent {
     translator: TranslatorInstance,
     sourceLanguage: string,
     text: string,
+    isCurrent: () => boolean,
   ): Promise<string> {
     const cacheKey = `${sourceLanguage}\u0000${text}`;
     const cached = translationCache.get(cacheKey);
@@ -238,7 +265,10 @@ namespace ForceTranslateContent {
     if (!core) return text;
     const parts = splitLongText(core);
     const translatedParts: string[] = [];
-    for (const part of parts) translatedParts.push(await translator.translate(part));
+    for (const part of parts) {
+      if (!isCurrent()) return text;
+      translatedParts.push(await translator.translate(part));
+    }
     const translated = preserveOuterWhitespace(text, translatedParts.join(""));
 
     if (translationCache.size >= 3000) {
@@ -249,18 +279,28 @@ namespace ForceTranslateContent {
     return translated;
   }
 
-  async function translateBatchTop(sourceLanguage: string, texts: string[]): Promise<string[]> {
+  async function translateBatchTop(
+    sourceLanguage: string,
+    texts: string[],
+    isCurrent: (index: number) => boolean = () => true,
+  ): Promise<string[]> {
     if (sourceLanguage === TARGET_LANGUAGE) return texts;
+    if (!texts.some((_, index) => isCurrent(index))) return texts;
+    // 別言語のダウンロード・初期化で、準備済みモデルの翻訳まで止めない。
+    const translator = await ensureTranslator(sourceLanguage);
     return enqueueAiTask(async () => {
-      const translator = await ensureTranslator(sourceLanguage);
       const results: string[] = [];
-      for (const text of texts) results.push(await translateOne(translator, sourceLanguage, text));
+      for (const [index, text] of texts.entries()) {
+        results.push(isCurrent(index)
+          ? await translateOne(translator, sourceLanguage, text, () => isCurrent(index))
+          : text);
+      }
       return results;
     });
   }
 
-  async function translateBatch(sourceLanguage: string, texts: string[]): Promise<string[]> {
-    if (isTopFrame) return translateBatchTop(sourceLanguage, texts);
+  async function translateBatch(sourceLanguage: string, texts: string[], isCurrent: (index: number) => boolean): Promise<string[]> {
+    if (isTopFrame) return translateBatchTop(sourceLanguage, texts, isCurrent);
     const response = await chrome.runtime.sendMessage<BatchResponse>({
       type: "FT_PROXY_TRANSLATE_BATCH",
       sourceLanguage,
@@ -382,6 +422,11 @@ namespace ForceTranslateContent {
       Boolean(language) && language !== TARGET_LANGUAGE))];
   }
 
+  function isCurrentCandidate({ node, original }: TranslationCandidate, version: number): boolean {
+    return active && version === runVersion && node.isConnected && node.data === original &&
+      !shouldSkipText(node) && node.data !== translations.get(node)?.translated;
+  }
+
   async function translateNodes(nodes: Text[], version: number): Promise<void> {
     if (!nodes.length || !active || version !== runVersion) return;
 
@@ -408,23 +453,21 @@ namespace ForceTranslateContent {
       byLanguage.set(sourceLanguage, group);
     }
 
-    let firstError: unknown;
-    for (const [sourceLanguage, candidates] of byLanguage) {
-      if (modelIssues.has(sourceLanguage) && !translatorPromises.has(sourceLanguage)) continue;
+    const results = await Promise.allSettled([...byLanguage].map(async ([sourceLanguage, candidates]) => {
+      if (modelIssues.has(sourceLanguage) && !translatorPromises.has(sourceLanguage)) return;
       try {
         for (let offset = 0; offset < candidates.length; offset += BATCH_SIZE) {
           if (!active || version !== runVersion) return;
-          const batch = candidates.slice(offset, offset + BATCH_SIZE).filter(({ node, original }) =>
-            node.isConnected && node.data === original && !shouldSkipText(node) &&
-            node.data !== translations.get(node)?.translated);
+          const batch = candidates.slice(offset, offset + BATCH_SIZE).filter((item) => isCurrentCandidate(item, version));
           if (!batch.length) continue;
-          const translated = await translateBatch(sourceLanguage, batch.map((item) => item.original));
+          const translated = await translateBatch(sourceLanguage, batch.map((item) => item.original),
+            (index) => isCurrentCandidate(batch[index], version));
           // 停止・再開中に終わった古い翻訳をDOMへ反映しない。
           if (!active || version !== runVersion) return;
 
           translated.forEach((value, index) => {
             const item = batch[index];
-            if (!item || !item.node.isConnected || item.node.data !== item.original || shouldSkipText(item.node)) return;
+            if (!item || !isCurrentCandidate(item, version)) return;
             if (value === item.original) return;
 
             // 記録を先に置いてからnode.dataだけを書き換える。
@@ -441,11 +484,11 @@ namespace ForceTranslateContent {
         if (version === runVersion && (error instanceof ActivationRequiredError || error instanceof AiUnavailableError)) {
           modelIssues.set(sourceLanguage, error);
         }
-        // ある言語のモデルが未準備でも、他の言語の投稿は処理する。
-        firstError ??= error;
+        throw error;
       }
-    }
-    if (firstError) throw firstError;
+    }));
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   }
 
   const mutationObserver = new MutationObserver((mutations) => {
@@ -461,26 +504,48 @@ namespace ForceTranslateContent {
         continue;
       }
 
+      if (mutation.type === "attributes") {
+        // 仮想リストが既存要素のidだけを本文・プレビュー用に変えた場合。
+        pendingRoots.add(mutation.target);
+        continue;
+      }
+
       // ReactがtextContent/innerHTML等でTextNodeごと差し替えた場合。
       mutation.addedNodes.forEach((node) => pendingRoots.add(node));
     }
 
+    schedulePendingTranslation();
+  });
+
+  function schedulePendingTranslation(): void {
     // 更新が続くチャットでも処理を先送りし続けない。自分の変更だけなら予約しない。
-    if (!pendingRoots.size || mutationTimer !== null) return;
+    if ((!pendingRoots.size && !discordScrollPending) || mutationTimer !== null) return;
     mutationTimer = window.setTimeout(() => {
       mutationTimer = null;
       if (!active) return;
       const version = runVersion;
       const roots = [...pendingRoots];
       pendingRoots.clear();
+      const rescanDiscord = discordScrollPending;
+      discordScrollPending = false;
       discoverAndObserveShadowRoots(document);
 
+      if (rescanDiscord) {
+        for (const root of observedRoots) roots.push(...root.querySelectorAll(DISCORD_CONTENT_SELECTOR));
+      }
       const nodes = new Set<Text>();
       for (const root of roots) collectCandidateNodes(root).forEach((node) => nodes.add(node));
-      void translateNodes([...nodes], version).catch(notifyError);
+      void (rescanDiscord ? recheckPendingModels(version) : Promise.resolve())
+        .then(() => translateNodes([...nodes], version)).catch(notifyError);
       pruneDetachedRecords();
     }, MUTATION_DEBOUNCE_MS);
-  });
+  }
+
+  function translateDiscordOnScroll(): void {
+    if (!active) return;
+    discordScrollPending = true;
+    schedulePendingTranslation();
+  }
 
   function observeRoot(root: Document | ShadowRoot): void {
     if (observedRoots.has(root)) return;
@@ -489,6 +554,7 @@ namespace ForceTranslateContent {
       subtree: true,
       childList: true,
       characterData: true,
+      ...(isDiscord ? { attributes: true, attributeFilter: ["id"] } : {}),
     });
   }
 
@@ -514,8 +580,11 @@ namespace ForceTranslateContent {
   }
 
   function pruneDetachedRecords(): void {
-    for (const node of translations.keys()) {
-      if (!node.isConnected) translations.delete(node);
+    for (const [node, record] of translations) {
+      if (node.isConnected) continue;
+      // 仮想リストが外したTextNodeを再利用しても、日本語を原文と誤認しない。
+      if (node.data === record.translated) node.data = record.original;
+      translations.delete(node);
     }
   }
 
@@ -536,6 +605,7 @@ namespace ForceTranslateContent {
     mutationObserver.disconnect();
     observedRoots.clear();
     pendingRoots.clear();
+    discordScrollPending = false;
     if (mutationTimer !== null) {
       window.clearTimeout(mutationTimer);
       mutationTimer = null;
@@ -552,6 +622,8 @@ namespace ForceTranslateContent {
     const version = runVersion;
     sourceLanguageCache = undefined;
     modelIssues.clear();
+    lastModelRecheckAt = -Infinity;
+    modelRecheckPromise = null;
 
     discoverAndObserveShadowRoots(document);
     startShadowScan();
@@ -567,7 +639,7 @@ namespace ForceTranslateContent {
 
     for (const [node, record] of translations) {
       // React側が既に別文字列へ更新している場合は上書きしない。
-      if (node.isConnected && node.data === record.translated) {
+      if (node.data === record.translated) {
         node.data = record.original;
       }
     }
@@ -673,6 +745,10 @@ namespace ForceTranslateContent {
     window.addEventListener("mousedown", prewarmTranslatorFromGesture, true);
     window.addEventListener("contextmenu", prewarmTranslatorFromGesture, true);
     window.addEventListener("keydown", prewarmTranslatorFromGesture, true);
+  }
+  if (isDiscord) {
+    // Discordはウィンドウの内側をスクロールするためcaptureで拾う。
+    window.addEventListener("scroll", translateDiscordOnScroll, { capture: true, passive: true });
   }
 
   // 右クリック前に言語だけ解決しておくと、user gesture中にTranslator.create()を即開始できる。
