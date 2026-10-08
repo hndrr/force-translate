@@ -34,6 +34,7 @@ function fixture(t, { html = "", lang = "ja", url = "https://discord.com/channel
   const { window } = dom;
   const calls = [];
   const detections = [];
+  const availabilityChecks = [];
   const errors = [];
   const alerts = [];
   let listener;
@@ -49,7 +50,10 @@ function fixture(t, { html = "", lang = "ja", url = "https://discord.com/channel
     } },
   };
   window.Translator = {
-    availability: async ({ sourceLanguage }) => availability?.(sourceLanguage) ?? "available",
+    availability: async ({ sourceLanguage }) => {
+      availabilityChecks.push(sourceLanguage);
+      return availability?.(sourceLanguage) ?? "available";
+    },
     create: async ({ sourceLanguage }) => ({ translate: async (text) => {
       calls.push({ language: sourceLanguage, text });
       return translate ? translate(text, sourceLanguage) : `翻訳(${sourceLanguage}):${text}`;
@@ -59,7 +63,7 @@ function fixture(t, { html = "", lang = "ja", url = "https://discord.com/channel
   window.alert = (message) => alerts.push(message);
   script.runInContext(dom.getInternalVMContext());
   return {
-    window, document: window.document, calls, detections, errors, alerts,
+    window, document: window.document, calls, detections, availabilityChecks, errors, alerts,
     start: () => listener({ type: "FT_START_TRANSLATION" }, {}, () => {}),
     stop: () => listener({ type: "FT_RESTORE_ORIGINAL" }, {}, () => {}),
     status: () => new Promise((resolve) => listener({ type: "FT_GET_STATUS" }, {}, resolve)),
@@ -249,11 +253,87 @@ test("翻訳モデルが未準備の言語があっても、準備済みの言�
     <div id="message-content-1">Hello everyone!</div>
     <div id="message-content-2">Bonjour tout le monde!</div>`, availability: (language) => language === "en" ? "downloadable" : "available" });
   f.start();
-  await waitFor(() => f.alerts.length === 1);
+  await waitFor(() => f.document.getElementById("message-content-2").textContent.startsWith("翻訳"));
   assert.equal(f.document.getElementById("message-content-1").textContent, "Hello everyone!");
   assert.equal(f.document.getElementById("message-content-2").textContent, "翻訳(fr):Bonjour tout le monde!");
   assert.equal((await f.status()).sourceLanguage, "en");
+  assert.equal(f.alerts.length, 0, "未準備のモデルでページを遮る警告を出さない");
 });
+
+for (const initialAvailability of ["downloadable", "downloading", "unavailable"]) {
+  test(`モデルが${initialAvailability}でも表示更新で警告・再試行を繰り返さず、手動更新で再開する`, async (t) => {
+    let modelReady = false;
+    const f = fixture(t, { html: '<main><div id="message-content-1">Hello everyone!</div></main>',
+      availability: (language) => language === "en" && !modelReady ? initialAvailability : "available" });
+    const message = f.document.getElementById("message-content-1");
+    f.start();
+    await waitFor(() => f.errors.length === 1);
+    const issue = (await f.status()).modelIssues?.[0];
+    assert.equal(issue?.language, "en");
+    assert.equal(issue?.kind, initialAvailability === "unavailable" ? "unavailable" : "activation-required");
+    const now = f.window.Date.now();
+    for (let index = 1; index <= 3; index++) {
+      f.window.Date.now = () => now + index * 6000;
+      message.firstChild.data = `English update number ${index}.`;
+      const french = f.document.createElement("div");
+      french.id = `message-content-french-${index}`;
+      french.textContent = `Bonjour tout le monde! ${index}`;
+      f.document.querySelector("main").append(french);
+      await waitFor(() => french.textContent.startsWith("翻訳"));
+    }
+    assert.equal(f.alerts.length, 0);
+    assert.equal(f.errors.length, 1, "同じ未準備モデルのエラーを再発させない");
+    assert.equal(f.availabilityChecks.filter(language => language === "en").length, 1);
+    assert.equal(message.textContent, "English update number 3.");
+    modelReady = true;
+    f.start();
+    await waitFor(() => message.textContent === "翻訳(en):English update number 3.");
+    assert.deepEqual([...(await f.status()).modelIssues], []);
+    f.stop();
+    assert.equal(message.textContent, "English update number 3.");
+    assert.deepEqual([...(await f.status()).modelIssues], []);
+  });
+}
+
+test("Translator APIがなくてもページに警告を出さず、ポップアップ用の状態で伝える", async (t) => {
+  const f = fixture(t, { html: '<div id="message-content-1">Hello everyone!</div>' });
+  delete f.window.Translator;
+  f.start();
+  await waitFor(() => f.errors.length === 1);
+  assert.equal(f.alerts.length, 0);
+  assert.equal((await f.status()).modelIssues?.[0]?.kind, "unavailable");
+});
+
+test("取得済みモデルがdownloadableと報告されても、ページ操作があれば翻訳を開始する", async (t) => {
+  const f = fixture(t, { html: '<div id="message-content-1">Hello everyone!</div>', availability: () => "downloadable" });
+  Object.defineProperty(f.window.navigator, "userActivation", { value: { isActive: true } });
+  f.start();
+  await waitFor(() => f.document.getElementById("message-content-1").textContent.startsWith("翻訳"));
+  assert.equal(f.alerts.length, 0);
+  assert.deepEqual([...(await f.status()).modelIssues], []);
+});
+
+for (const eventName of ["mousedown", "keydown"]) {
+  test(`準備済みモデルでも必要なページ側の初期化を${eventName}で行い、保留中の投稿も再開する`, async (t) => {
+    const f = fixture(t, { html: '<div id="message-content-1">Hello everyone!</div>', availability: () => "downloadable" });
+    const userActivation = { isActive: false };
+    Object.defineProperty(f.window.navigator, "userActivation", { value: userActivation });
+    f.start();
+    await waitFor(() => f.errors.length === 1);
+    const issue = (await f.status()).modelIssues[0];
+    assert.equal(issue.kind, "activation-required");
+    assert.ok(!issue.message.includes("モデルを準備"), "取得済みか不明な状態をダウンロード未完了と表示しない");
+    userActivation.isActive = true;
+    const event = eventName === "mousedown" ? new f.window.MouseEvent(eventName, { button: 0 }) : new f.window.KeyboardEvent(eventName, { key: "ArrowDown" });
+    f.window.dispatchEvent(event);
+    await waitFor(() => f.document.getElementById("message-content-1").textContent.startsWith("翻訳"));
+    assert.deepEqual([...(await f.status()).modelIssues], []);
+    assert.equal(f.availabilityChecks.length, 1, "ページのユーザー操作中に直接createを開始する");
+    assert.equal(f.alerts.length, 0);
+    f.stop();
+    assert.equal(f.document.getElementById("message-content-1").textContent, "Hello everyone!");
+  });
+}
 
 test("チャットでDOM更新が続いても新着の翻訳を先送りし続けない", async (t) => {
   const f = fixture(t, { html: '<div id="ticker">0</div><main></main>' });

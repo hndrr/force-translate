@@ -55,3 +55,42 @@ test("複数の翻訳モデルをクリック中に全て準備し、完了後�
   assert.equal(window.document.querySelector("#progressBar").style.width, "100%");
   assert.equal(window.document.querySelector("#stateBadge").textContent, "翻訳中");
 });
+
+for (const kind of ["activation-required", "unavailable"]) {
+  test(`翻訳の${kind}状態をページの警告ではなくポップアップに表示する`, async (t) => {
+    const dom = new JSDOM(html, { runScripts: "outside-only", url: "https://extension.test/popup.html" });
+    t.after(() => dom.window.close());
+    const { window } = dom;
+    const alerts = [];
+    let starts = 0;
+    const explanation = "en → ja の翻訳を利用できません";
+    window.alert = text => alerts.push(text);
+    window.chrome = {
+      tabs: {
+        query: async () => [{ id: 1, url: "https://discord.com/channels/server/channel" }],
+        sendMessage: async (_id, request) => {
+          if (request.type === "FT_START_TRANSLATION") starts++;
+          return { ok: true, active: true, origin: "https://discord.com", sourceLanguage: "en", sourceLanguages: ["en"],
+            modelIssues: [{ language: "en", kind, message: explanation }] };
+        },
+      },
+      storage: { local: { get: async () => ({}) } },
+    };
+    window.Translator = { create: async () => ({ destroy() {} }) };
+    script.runInContext(dom.getInternalVMContext());
+    const document = window.document;
+    const button = document.querySelector("#translateButton");
+    await waitFor(() => !button.disabled);
+    const expected = kind === "activation-required"
+      ? "一部の翻訳はページでの操作待ちです。ページ内をクリックすると自動で再開します。" : explanation;
+    assert.equal(document.querySelector("#stateBadge").textContent, "一部保留");
+    assert.equal(document.querySelector("#message").textContent, expected);
+    assert.equal(document.querySelector("#message").classList.contains("error"), kind === "unavailable");
+    assert.equal(document.querySelector("#restoreButton").disabled, false);
+    button.click();
+    await waitFor(() => starts === 1 && !button.disabled);
+    assert.equal(document.querySelector("#message").textContent, expected, "ページ側の初期化待ちを準備完了のメッセージで隠さない");
+    assert.equal(document.querySelector("#stateBadge").textContent, "一部保留");
+    assert.equal(alerts.length, 0);
+  });
+}
