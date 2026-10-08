@@ -7,6 +7,7 @@ namespace ForceTranslatePopup {
     active: boolean;
     sourceLanguage: string | null;
     sourceLanguages?: string[];
+    modelIssues?: Array<{ language: string; kind: "activation-required" | "unavailable"; message: string }>;
     origin: string | null;
   };
 
@@ -39,6 +40,17 @@ namespace ForceTranslatePopup {
     message.classList.toggle("error", isError);
   }
 
+  function setStatusMessage(fallback = ""): void {
+    const issues = pageStatus?.modelIssues ?? [];
+    if (issues.some((issue) => issue.kind === "activation-required")) {
+      setMessage("一部の翻訳はページでの操作待ちです。ページ内をクリックすると自動で再開します。");
+    } else if (issues.length) {
+      setMessage(issues.map((issue) => issue.message).join("\n"), true);
+    } else {
+      setMessage(fallback);
+    }
+  }
+
   function setBusy(next: boolean): void {
     busy = next;
     translateButton.disabled = next || !activeTab?.id || !pageStatus?.sourceLanguage;
@@ -48,7 +60,7 @@ namespace ForceTranslatePopup {
 
   function renderStatus(status: PageStatus): void {
     pageStatus = status;
-    stateBadge.textContent = status.active ? "翻訳中" : "待機";
+    stateBadge.textContent = status.active ? (status.modelIssues?.length ? "一部保留" : "翻訳中") : "待機";
     stateBadge.classList.toggle("active", status.active);
     translateButton.textContent = status.active ? "翻訳を更新" : "このページを翻訳";
     restoreButton.disabled = busy || !status.active;
@@ -124,7 +136,7 @@ namespace ForceTranslatePopup {
       await preparation;
       await chrome.tabs.sendMessage(activeTab.id, { type: "FT_START_TRANSLATION" });
       renderStatus(await fetchPageStatus());
-      setMessage("翻訳を開始しました");
+      setStatusMessage("翻訳を開始しました");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error), true);
     } finally {
@@ -166,6 +178,7 @@ namespace ForceTranslatePopup {
         setMessage("このサイトの自動翻訳をOFFにしました");
       }
       renderStatus(await fetchPageStatus());
+      setStatusMessage(enabled ? "このサイトの自動翻訳をONにしました" : "このサイトの自動翻訳をOFFにしました");
     } catch (error) {
       autoToggle.checked = !enabled;
       setMessage(error instanceof Error ? error.message : String(error), true);
@@ -192,6 +205,7 @@ namespace ForceTranslatePopup {
       const status = await fetchPageStatus();
       renderStatus(status);
       autoToggle.checked = (await getAutoOrigins()).includes(origin);
+      setStatusMessage();
       setBusy(false);
     } catch {
       translateButton.disabled = true;

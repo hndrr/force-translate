@@ -30,6 +30,18 @@ var ForceTranslatePopup;
         message.textContent = text;
         message.classList.toggle("error", isError);
     }
+    function setStatusMessage(fallback = "") {
+        const issues = pageStatus?.modelIssues ?? [];
+        if (issues.some((issue) => issue.kind === "activation-required")) {
+            setMessage("一部の翻訳はページでの操作待ちです。ページ内をクリックすると自動で再開します。");
+        }
+        else if (issues.length) {
+            setMessage(issues.map((issue) => issue.message).join("\n"), true);
+        }
+        else {
+            setMessage(fallback);
+        }
+    }
     function setBusy(next) {
         busy = next;
         translateButton.disabled = next || !activeTab?.id || !pageStatus?.sourceLanguage;
@@ -38,7 +50,7 @@ var ForceTranslatePopup;
     }
     function renderStatus(status) {
         pageStatus = status;
-        stateBadge.textContent = status.active ? "翻訳中" : "待機";
+        stateBadge.textContent = status.active ? (status.modelIssues?.length ? "一部保留" : "翻訳中") : "待機";
         stateBadge.classList.toggle("active", status.active);
         translateButton.textContent = status.active ? "翻訳を更新" : "このページを翻訳";
         restoreButton.disabled = busy || !status.active;
@@ -109,7 +121,7 @@ var ForceTranslatePopup;
             await preparation;
             await chrome.tabs.sendMessage(activeTab.id, { type: "FT_START_TRANSLATION" });
             renderStatus(await fetchPageStatus());
-            setMessage("翻訳を開始しました");
+            setStatusMessage("翻訳を開始しました");
         }
         catch (error) {
             setMessage(error instanceof Error ? error.message : String(error), true);
@@ -156,6 +168,7 @@ var ForceTranslatePopup;
                 setMessage("このサイトの自動翻訳をOFFにしました");
             }
             renderStatus(await fetchPageStatus());
+            setStatusMessage(enabled ? "このサイトの自動翻訳をONにしました" : "このサイトの自動翻訳をOFFにしました");
         }
         catch (error) {
             autoToggle.checked = !enabled;
@@ -181,6 +194,7 @@ var ForceTranslatePopup;
             const status = await fetchPageStatus();
             renderStatus(status);
             autoToggle.checked = (await getAutoOrigins()).includes(origin);
+            setStatusMessage();
             setBusy(false);
         }
         catch {

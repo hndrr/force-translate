@@ -66,6 +66,7 @@ namespace ForceTranslateContent {
   const pendingRoots = new Set<Node>();
   const translationCache = new Map<string, string>();
   const translatorPromises = new Map<string, Promise<TranslatorInstance>>();
+  const modelIssues = new Map<string, ActivationRequiredError | AiUnavailableError>();
   const contentLanguageCache = new WeakMap<Element, {
     sample: string;
     language: Promise<string | null>;
@@ -122,19 +123,8 @@ namespace ForceTranslateContent {
     lastErrorAt = now;
     console.error("[Force Translate]", error);
 
-    // ページDOMに通知要素を挿入しない。Reactの管理DOMを構造変更しないため。
-    // 初回モデル準備が必要なケースだけ、ユーザーに次の操作を明示する。
-    if (error instanceof ActivationRequiredError) {
-      window.alert(
-        "Force Translate: 翻訳モデルの準備が必要です。\n" +
-          "ChromeツールバーのForce Translateアイコンを開き、『このページを翻訳』を押してください。",
-      );
-      return;
-    }
-
-    if (error instanceof AiUnavailableError) {
-      window.alert(`Force Translate: ${message}`);
-    }
+    // バックグラウンド翻訳でページを遮るalertを出さない。
+    // 操作待ち・利用不可の状態は拡張のポップアップから確認できる。
   }
 
   function createTranslatorFromGesture(sourceLanguage: string): Promise<TranslatorInstance> {
@@ -164,30 +154,39 @@ namespace ForceTranslateContent {
     }
 
     translatorPromises.set(sourceLanguage, promise);
-    promise.catch(() => translatorPromises.delete(sourceLanguage));
+    promise.then(() => modelIssues.delete(sourceLanguage), () => {
+      if (translatorPromises.get(sourceLanguage) === promise) translatorPromises.delete(sourceLanguage);
+    });
     return promise;
   }
 
   async function ensureTranslator(sourceLanguage: string): Promise<TranslatorInstance> {
     const existing = translatorPromises.get(sourceLanguage);
     if (existing) return existing;
-    if (!("Translator" in globalThis)) {
-      throw new AiUnavailableError("このChromeではTranslator APIが利用できません");
+    const issue = modelIssues.get(sourceLanguage);
+    if (issue) throw issue;
+    const version = runVersion;
+    try {
+      if (!("Translator" in globalThis)) {
+        throw new AiUnavailableError("このChromeではTranslator APIが利用できません");
+      }
+      const options = { sourceLanguage, targetLanguage: TARGET_LANGUAGE };
+      const availability = await Translator.availability(options);
+      if (availability === "unavailable") {
+        throw new AiUnavailableError(`${sourceLanguage} → ja の翻訳を利用できません`);
+      }
+      // downloadableは取得済みでもサイトごとの初期化前に返る。
+      // ダウンロードの有無を決めつけず、ページの操作があればcreate()する。
+      if (availability !== "available" && !navigator.userActivation?.isActive) {
+        throw new ActivationRequiredError(`${sourceLanguage} → ja の翻訳を開始するには、このページでの操作が必要です`);
+      }
+      return await createTranslatorFromGesture(sourceLanguage);
+    } catch (error) {
+      if (version === runVersion && (error instanceof ActivationRequiredError || error instanceof AiUnavailableError)) {
+        modelIssues.set(sourceLanguage, error);
+      }
+      throw error;
     }
-
-    const options = { sourceLanguage, targetLanguage: TARGET_LANGUAGE };
-    const availability = await Translator.availability(options);
-    if (availability === "unavailable") {
-      throw new AiUnavailableError(`${sourceLanguage} → ja の翻訳モデルを利用できません`);
-    }
-    if (availability === "downloadable" || availability === "downloading") {
-      throw new ActivationRequiredError("Chrome内蔵の翻訳モデルを準備する必要があります");
-    }
-
-    const promise = Translator.create(options);
-    translatorPromises.set(sourceLanguage, promise);
-    promise.catch(() => translatorPromises.delete(sourceLanguage));
-    return promise;
   }
 
   async function detectLanguage(sample: string): Promise<string | null> {
@@ -411,6 +410,7 @@ namespace ForceTranslateContent {
 
     let firstError: unknown;
     for (const [sourceLanguage, candidates] of byLanguage) {
+      if (modelIssues.has(sourceLanguage) && !translatorPromises.has(sourceLanguage)) continue;
       try {
         for (let offset = 0; offset < candidates.length; offset += BATCH_SIZE) {
           if (!active || version !== runVersion) return;
@@ -438,6 +438,9 @@ namespace ForceTranslateContent {
           });
         }
       } catch (error) {
+        if (version === runVersion && (error instanceof ActivationRequiredError || error instanceof AiUnavailableError)) {
+          modelIssues.set(sourceLanguage, error);
+        }
         // ある言語のモデルが未準備でも、他の言語の投稿は処理する。
         firstError ??= error;
       }
@@ -548,6 +551,7 @@ namespace ForceTranslateContent {
     runVersion += 1;
     const version = runVersion;
     sourceLanguageCache = undefined;
+    modelIssues.clear();
 
     discoverAndObserveShadowRoots(document);
     startShadowScan();
@@ -558,6 +562,7 @@ namespace ForceTranslateContent {
     active = false;
     runVersion += 1;
     sourceLanguageCache = undefined;
+    modelIssues.clear();
     stopObservers();
 
     for (const [node, record] of translations) {
@@ -569,13 +574,19 @@ namespace ForceTranslateContent {
     translations.clear();
   }
 
-  function prewarmTranslatorFromGesture(event: MouseEvent): void {
-    if (!isTopFrame || event.button !== 2 || !("Translator" in globalThis)) return;
+  function prewarmTranslatorFromGesture(event: MouseEvent | KeyboardEvent): void {
+    if (!isTopFrame || !("Translator" in globalThis)) return;
+    // 自動翻訳中は通常のクリック・キー操作でもページ側を初期化する。
+    // 右クリックによる手動翻訳の準備は、翻訳開始前にも行う。
+    if (!active && (!(event instanceof MouseEvent) || event.button !== 2)) return;
+    if (!navigator.userActivation?.isActive) return;
     const declared = normalizeLanguage(document.documentElement.lang);
     const sources = new Set([...knownContentLanguages, sourceLanguageCache ?? declared]);
     for (const source of sources) {
       if (!source || source === TARGET_LANGUAGE || translatorPromises.has(source)) continue;
-      void createTranslatorFromGesture(source).catch((error: unknown) => {
+      void createTranslatorFromGesture(source).then(() => {
+        if (active) return translateNodes(collectAllCandidateNodes(), runVersion);
+      }).catch((error: unknown) => {
         console.warn("[Force Translate] translator prewarm failed", error);
       });
     }
@@ -616,6 +627,10 @@ namespace ForceTranslateContent {
             active,
             sourceLanguage: sourceLanguages[0] ?? await resolvePageSourceLanguage(),
             sourceLanguages,
+            modelIssues: sourceLanguages.flatMap((language) => {
+              const issue = modelIssues.get(language);
+              return issue ? [{ language, kind: issue instanceof ActivationRequiredError ? "activation-required" : "unavailable", message: issue.message }] : [];
+            }),
             origin: pageOrigin(),
           });
         })
@@ -625,6 +640,7 @@ namespace ForceTranslateContent {
             active,
             sourceLanguage: null,
             sourceLanguages: [],
+            modelIssues: [],
             origin: pageOrigin(),
           });
         });
@@ -656,6 +672,7 @@ namespace ForceTranslateContent {
     // mousedown + contextmenuの両方を見る。ブラウザ/OS差で片方しかactivationを持たない場合に備える。
     window.addEventListener("mousedown", prewarmTranslatorFromGesture, true);
     window.addEventListener("contextmenu", prewarmTranslatorFromGesture, true);
+    window.addEventListener("keydown", prewarmTranslatorFromGesture, true);
   }
 
   // 右クリック前に言語だけ解決しておくと、user gesture中にTranslator.create()を即開始できる。
