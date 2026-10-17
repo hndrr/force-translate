@@ -8,6 +8,12 @@ var ForceTranslateContent;
     const BATCH_SIZE = 20;
     const MUTATION_DEBOUNCE_MS = 180;
     const SHADOW_SCAN_INTERVAL_MS = 1800;
+    const MODEL_RECHECK_INTERVAL_MS = 1800;
+    // UI・本文・リンクプレビューはそれぞれ別の言語になり得る。
+    // プレビューは本文の外にあるarticle単位で扱い、ハッシュ付きclass名には依存しない。
+    const DISCORD_EMBED_SELECTOR = '[id^="message-accessories-"] article';
+    const DISCORD_CONTENT_SELECTOR = `[id^="message-content-"], ${DISCORD_EMBED_SELECTOR}`;
+    const isDiscord = /^(?:(?:canary|ptb)\.)?discord(?:app)?\.com$/i.test(location.hostname);
     const SUPPORTED_LANGUAGES = new Set([
         "ar", "bg", "bn", "cs", "da", "de", "el", "en", "es", "fi", "fr",
         "he", "hi", "hr", "hu", "id", "it", "ja", "kn", "ko", "lt", "mr",
@@ -40,11 +46,17 @@ var ForceTranslateContent;
     const pendingRoots = new Set();
     const translationCache = new Map();
     const translatorPromises = new Map();
+    const modelIssues = new Map();
+    const contentLanguageCache = new WeakMap();
+    const knownContentLanguages = new Set();
     let active = false;
     let runVersion = 0;
     let sourceLanguageCache;
     let mutationTimer = null;
     let shadowScanTimer = null;
+    let discordScrollPending = false;
+    let lastModelRecheckAt = -Infinity;
+    let modelRecheckPromise = null;
     let aiQueue = Promise.resolve();
     let lastErrorMessage = "";
     let lastErrorAt = 0;
@@ -90,16 +102,8 @@ var ForceTranslateContent;
         lastErrorMessage = message;
         lastErrorAt = now;
         console.error("[Force Translate]", error);
-        // ページDOMに通知要素を挿入しない。Reactの管理DOMを構造変更しないため。
-        // 初回モデル準備が必要なケースだけ、ユーザーに次の操作を明示する。
-        if (error instanceof ActivationRequiredError) {
-            window.alert("Force Translate: 翻訳モデルの準備が必要です。\n" +
-                "ChromeツールバーのForce Translateアイコンを開き、『このページを翻訳』を押してください。");
-            return;
-        }
-        if (error instanceof AiUnavailableError) {
-            window.alert(`Force Translate: ${message}`);
-        }
+        // バックグラウンド翻訳でページを遮るalertを出さない。
+        // 操作待ち・利用不可の状態は拡張のポップアップから確認できる。
     }
     function createTranslatorFromGesture(sourceLanguage) {
         const existing = translatorPromises.get(sourceLanguage);
@@ -126,27 +130,67 @@ var ForceTranslateContent;
             return Promise.reject(error);
         }
         translatorPromises.set(sourceLanguage, promise);
-        promise.catch(() => translatorPromises.delete(sourceLanguage));
+        promise.then(() => modelIssues.delete(sourceLanguage), () => {
+            if (translatorPromises.get(sourceLanguage) === promise)
+                translatorPromises.delete(sourceLanguage);
+        });
         return promise;
     }
     async function ensureTranslator(sourceLanguage) {
         const existing = translatorPromises.get(sourceLanguage);
         if (existing)
             return existing;
-        if (!("Translator" in globalThis)) {
-            throw new AiUnavailableError("このChromeではTranslator APIが利用できません");
+        const issue = modelIssues.get(sourceLanguage);
+        if (issue)
+            throw issue;
+        const version = runVersion;
+        try {
+            if (!("Translator" in globalThis)) {
+                throw new AiUnavailableError("このChromeではTranslator APIが利用できません");
+            }
+            const options = { sourceLanguage, targetLanguage: TARGET_LANGUAGE };
+            const availability = await Translator.availability(options);
+            if (availability === "unavailable") {
+                throw new AiUnavailableError(`${sourceLanguage} → ja の翻訳を利用できません`);
+            }
+            // downloadableは取得済みでもサイトごとの初期化前に返る。
+            // ダウンロードの有無を決めつけず、ページの操作があればcreate()する。
+            if (availability !== "available" && !navigator.userActivation?.isActive) {
+                throw new ActivationRequiredError(`${sourceLanguage} → ja の翻訳を開始するには、このページでの操作が必要です`);
+            }
+            return await createTranslatorFromGesture(sourceLanguage);
         }
-        const options = { sourceLanguage, targetLanguage: TARGET_LANGUAGE };
-        const availability = await Translator.availability(options);
-        if (availability === "unavailable") {
-            throw new AiUnavailableError(`${sourceLanguage} → ja の翻訳モデルを利用できません`);
+        catch (error) {
+            if (version === runVersion && (error instanceof ActivationRequiredError || error instanceof AiUnavailableError)) {
+                modelIssues.set(sourceLanguage, error);
+            }
+            throw error;
         }
-        if (availability === "downloadable" || availability === "downloading") {
-            throw new ActivationRequiredError("Chrome内蔵の翻訳モデルを準備する必要があります");
-        }
-        const promise = Translator.create(options);
-        translatorPromises.set(sourceLanguage, promise);
-        promise.catch(() => translatorPromises.delete(sourceLanguage));
+    }
+    function recheckPendingModels(version) {
+        if (!isTopFrame || !("Translator" in globalThis) || !modelIssues.size)
+            return Promise.resolve();
+        if (modelRecheckPromise)
+            return modelRecheckPromise;
+        if (Date.now() - lastModelRecheckAt < MODEL_RECHECK_INTERVAL_MS)
+            return Promise.resolve();
+        lastModelRecheckAt = Date.now();
+        const promise = Promise.all([...modelIssues].map(async ([sourceLanguage, issue]) => {
+            try {
+                const availability = await Translator.availability({ sourceLanguage, targetLanguage: TARGET_LANGUAGE });
+                if (active && version === runVersion && modelIssues.get(sourceLanguage) === issue && availability === "available") {
+                    modelIssues.delete(sourceLanguage);
+                }
+            }
+            catch {
+                // 状態確認の失敗は保留を維持する。スクロールで警告を繰り返さない。
+            }
+        })).then(() => undefined);
+        modelRecheckPromise = promise;
+        void promise.then(() => {
+            if (modelRecheckPromise === promise)
+                modelRecheckPromise = null;
+        });
         return promise;
     }
     async function detectLanguage(sample) {
@@ -188,7 +232,7 @@ var ForceTranslateContent;
         const trailing = original.match(/\s*$/u)?.[0] ?? "";
         return `${leading}${translatedCore.trim()}${trailing}`;
     }
-    async function translateOne(translator, sourceLanguage, text) {
+    async function translateOne(translator, sourceLanguage, text, isCurrent) {
         const cacheKey = `${sourceLanguage}\u0000${text}`;
         const cached = translationCache.get(cacheKey);
         if (cached !== undefined)
@@ -198,8 +242,11 @@ var ForceTranslateContent;
             return text;
         const parts = splitLongText(core);
         const translatedParts = [];
-        for (const part of parts)
+        for (const part of parts) {
+            if (!isCurrent())
+                return text;
             translatedParts.push(await translator.translate(part));
+        }
         const translated = preserveOuterWhitespace(text, translatedParts.join(""));
         if (translationCache.size >= 3000) {
             const firstKey = translationCache.keys().next().value;
@@ -209,20 +256,26 @@ var ForceTranslateContent;
         translationCache.set(cacheKey, translated);
         return translated;
     }
-    async function translateBatchTop(sourceLanguage, texts) {
+    async function translateBatchTop(sourceLanguage, texts, isCurrent = () => true) {
         if (sourceLanguage === TARGET_LANGUAGE)
             return texts;
+        if (!texts.some((_, index) => isCurrent(index)))
+            return texts;
+        // 別言語のダウンロード・初期化で、準備済みモデルの翻訳まで止めない。
+        const translator = await ensureTranslator(sourceLanguage);
         return enqueueAiTask(async () => {
-            const translator = await ensureTranslator(sourceLanguage);
             const results = [];
-            for (const text of texts)
-                results.push(await translateOne(translator, sourceLanguage, text));
+            for (const [index, text] of texts.entries()) {
+                results.push(isCurrent(index)
+                    ? await translateOne(translator, sourceLanguage, text, () => isCurrent(index))
+                    : text);
+            }
             return results;
         });
     }
-    async function translateBatch(sourceLanguage, texts) {
+    async function translateBatch(sourceLanguage, texts, isCurrent) {
         if (isTopFrame)
-            return translateBatchTop(sourceLanguage, texts);
+            return translateBatchTop(sourceLanguage, texts, isCurrent);
         const response = await chrome.runtime.sendMessage({
             type: "FT_PROXY_TRANSLATE_BATCH",
             sourceLanguage,
@@ -247,6 +300,9 @@ var ForceTranslateContent;
             return true;
         const parent = textNode.parentElement;
         if (!parent)
+            return true;
+        // カード内の画像エラーなどはDiscordのUI。言語判定にも混ぜない。
+        if (isDiscord && parent.closest(DISCORD_EMBED_SELECTOR) && parent.closest("button, [role='button']"))
             return true;
         return Boolean(parent.closest(EXCLUDED_SELECTOR));
     }
@@ -279,12 +335,19 @@ var ForceTranslateContent;
             return true;
         });
     }
-    function buildLanguageSample() {
+    function originalText(node) {
+        const record = translations.get(node);
+        return record && node.data === record.translated ? record.original : node.data;
+    }
+    function discordContent(node) {
+        return isDiscord ? node.parentElement?.closest(DISCORD_CONTENT_SELECTOR) ?? null : null;
+    }
+    function buildLanguageSample(root = document.body ?? document.documentElement, minimumLength = 8) {
         const parts = [];
         let length = 0;
-        for (const node of collectTextNodes(document.body ?? document.documentElement)) {
-            const text = node.data.trim();
-            if (text.length < 8)
+        for (const node of collectTextNodes(root)) {
+            const text = originalText(node).trim();
+            if (text.length < minimumLength)
                 continue;
             parts.push(text);
             length += text.length;
@@ -293,11 +356,11 @@ var ForceTranslateContent;
         }
         return parts.join("\n").slice(0, MAX_SAMPLE_LENGTH);
     }
-    async function resolveSourceLanguage() {
+    async function resolvePageSourceLanguage() {
         if (sourceLanguageCache !== undefined)
             return sourceLanguageCache;
         const declared = normalizeLanguage(document.documentElement.lang);
-        if (declared && declared !== TARGET_LANGUAGE) {
+        if (declared && (isDiscord || declared !== TARGET_LANGUAGE)) {
             sourceLanguageCache = declared;
             return declared;
         }
@@ -305,42 +368,102 @@ var ForceTranslateContent;
         sourceLanguageCache = detected;
         return detected;
     }
+    function resolveContentLanguage(content) {
+        const sample = buildLanguageSample(content, 1);
+        const cached = contentLanguageCache.get(content);
+        if (cached?.sample === sample)
+            return cached.language;
+        const language = detectLanguage(sample).then((detected) => {
+            // 短い英語（Hi / Thanks等）はChromeがundを返す場合がある。
+            // 日本語など別の文字体系を含む投稿には英語の補完を適用しない。
+            const letters = sample.match(/\p{L}/gu)?.join("") ?? "";
+            const source = detected ?? (/^[a-z]+$/i.test(letters) ? "en" : null);
+            if (source && source !== TARGET_LANGUAGE)
+                knownContentLanguages.add(source);
+            return source;
+        });
+        contentLanguageCache.set(content, { sample, language });
+        return language;
+    }
+    async function resolveSourceLanguages() {
+        const contentLanguages = isDiscord
+            ? await Promise.all([...document.querySelectorAll(DISCORD_CONTENT_SELECTOR)].map(resolveContentLanguage))
+            : [];
+        const languages = [...contentLanguages, await resolvePageSourceLanguage()];
+        return [...new Set(languages.filter((language) => Boolean(language) && language !== TARGET_LANGUAGE))];
+    }
+    function isCurrentCandidate({ node, original }, version) {
+        return active && version === runVersion && node.isConnected && node.data === original &&
+            !shouldSkipText(node) && node.data !== translations.get(node)?.translated;
+    }
     async function translateNodes(nodes, version) {
         if (!nodes.length || !active || version !== runVersion)
             return;
-        const sourceLanguage = await resolveSourceLanguage();
-        if (!sourceLanguage || sourceLanguage === TARGET_LANGUAGE)
-            return;
-        const candidates = [];
+        const groups = new Map();
         for (const node of nodes) {
             if (!node.isConnected || shouldSkipText(node))
                 continue;
-            const original = node.data;
-            if (!original.trim())
+            if (node.data === translations.get(node)?.translated)
                 continue;
-            candidates.push({ node, original });
+            const original = node.data;
+            const content = discordContent(node);
+            const group = groups.get(content) ?? [];
+            group.push({ node, original });
+            groups.set(content, group);
         }
-        for (let offset = 0; offset < candidates.length; offset += BATCH_SIZE) {
-            if (!active || version !== runVersion)
+        const resolved = await Promise.all([...groups].map(async ([content, candidates]) => ({
+            sourceLanguage: await (content ? resolveContentLanguage(content) : resolvePageSourceLanguage()),
+            candidates,
+        })));
+        const byLanguage = new Map();
+        for (const { sourceLanguage, candidates } of resolved) {
+            if (!sourceLanguage || sourceLanguage === TARGET_LANGUAGE)
+                continue;
+            const group = byLanguage.get(sourceLanguage) ?? [];
+            group.push(...candidates);
+            byLanguage.set(sourceLanguage, group);
+        }
+        const results = await Promise.allSettled([...byLanguage].map(async ([sourceLanguage, candidates]) => {
+            if (modelIssues.has(sourceLanguage) && !translatorPromises.has(sourceLanguage))
                 return;
-            const batch = candidates.slice(offset, offset + BATCH_SIZE);
-            const translated = await translateBatch(sourceLanguage, batch.map((item) => item.original));
-            translated.forEach((value, index) => {
-                const item = batch[index];
-                if (!item || !item.node.isConnected || item.node.data !== item.original)
-                    return;
-                if (value === item.original)
-                    return;
-                // 記録を先に置いてからnode.dataだけを書き換える。
-                // 要素の追加・ラップ・replaceWith等は一切しない。
-                translations.set(item.node, {
-                    original: item.original,
-                    translated: value,
-                    version,
-                });
-                item.node.data = value;
-            });
-        }
+            try {
+                for (let offset = 0; offset < candidates.length; offset += BATCH_SIZE) {
+                    if (!active || version !== runVersion)
+                        return;
+                    const batch = candidates.slice(offset, offset + BATCH_SIZE).filter((item) => isCurrentCandidate(item, version));
+                    if (!batch.length)
+                        continue;
+                    const translated = await translateBatch(sourceLanguage, batch.map((item) => item.original), (index) => isCurrentCandidate(batch[index], version));
+                    // 停止・再開中に終わった古い翻訳をDOMへ反映しない。
+                    if (!active || version !== runVersion)
+                        return;
+                    translated.forEach((value, index) => {
+                        const item = batch[index];
+                        if (!item || !isCurrentCandidate(item, version))
+                            return;
+                        if (value === item.original)
+                            return;
+                        // 記録を先に置いてからnode.dataだけを書き換える。
+                        // 要素の追加・ラップ・replaceWith等は一切しない。
+                        translations.set(item.node, {
+                            original: item.original,
+                            translated: value,
+                            version,
+                        });
+                        item.node.data = value;
+                    });
+                }
+            }
+            catch (error) {
+                if (version === runVersion && (error instanceof ActivationRequiredError || error instanceof AiUnavailableError)) {
+                    modelIssues.set(sourceLanguage, error);
+                }
+                throw error;
+            }
+        }));
+        const failed = results.find((result) => result.status === "rejected");
+        if (failed?.status === "rejected")
+            throw failed.reason;
     }
     const mutationObserver = new MutationObserver((mutations) => {
         if (!active)
@@ -355,11 +478,20 @@ var ForceTranslateContent;
                 pendingRoots.add(node);
                 continue;
             }
+            if (mutation.type === "attributes") {
+                // 仮想リストが既存要素のidだけを本文・プレビュー用に変えた場合。
+                pendingRoots.add(mutation.target);
+                continue;
+            }
             // ReactがtextContent/innerHTML等でTextNodeごと差し替えた場合。
             mutation.addedNodes.forEach((node) => pendingRoots.add(node));
         }
-        if (mutationTimer !== null)
-            window.clearTimeout(mutationTimer);
+        schedulePendingTranslation();
+    });
+    function schedulePendingTranslation() {
+        // 更新が続くチャットでも処理を先送りし続けない。自分の変更だけなら予約しない。
+        if ((!pendingRoots.size && !discordScrollPending) || mutationTimer !== null)
+            return;
         mutationTimer = window.setTimeout(() => {
             mutationTimer = null;
             if (!active)
@@ -367,14 +499,27 @@ var ForceTranslateContent;
             const version = runVersion;
             const roots = [...pendingRoots];
             pendingRoots.clear();
+            const rescanDiscord = discordScrollPending;
+            discordScrollPending = false;
             discoverAndObserveShadowRoots(document);
+            if (rescanDiscord) {
+                for (const root of observedRoots)
+                    roots.push(...root.querySelectorAll(DISCORD_CONTENT_SELECTOR));
+            }
             const nodes = new Set();
             for (const root of roots)
                 collectCandidateNodes(root).forEach((node) => nodes.add(node));
-            void translateNodes([...nodes], version).catch(notifyError);
+            void (rescanDiscord ? recheckPendingModels(version) : Promise.resolve())
+                .then(() => translateNodes([...nodes], version)).catch(notifyError);
             pruneDetachedRecords();
         }, MUTATION_DEBOUNCE_MS);
-    });
+    }
+    function translateDiscordOnScroll() {
+        if (!active)
+            return;
+        discordScrollPending = true;
+        schedulePendingTranslation();
+    }
     function observeRoot(root) {
         if (observedRoots.has(root))
             return;
@@ -383,6 +528,7 @@ var ForceTranslateContent;
             subtree: true,
             childList: true,
             characterData: true,
+            ...(isDiscord ? { attributes: true, attributeFilter: ["id"] } : {}),
         });
     }
     function discoverAndObserveShadowRoots(root) {
@@ -409,9 +555,13 @@ var ForceTranslateContent;
         return [...result];
     }
     function pruneDetachedRecords() {
-        for (const node of translations.keys()) {
-            if (!node.isConnected)
-                translations.delete(node);
+        for (const [node, record] of translations) {
+            if (node.isConnected)
+                continue;
+            // 仮想リストが外したTextNodeを再利用しても、日本語を原文と誤認しない。
+            if (node.data === record.translated)
+                node.data = record.original;
+            translations.delete(node);
         }
     }
     function startShadowScan() {
@@ -432,6 +582,7 @@ var ForceTranslateContent;
         mutationObserver.disconnect();
         observedRoots.clear();
         pendingRoots.clear();
+        discordScrollPending = false;
         if (mutationTimer !== null) {
             window.clearTimeout(mutationTimer);
             mutationTimer = null;
@@ -446,6 +597,9 @@ var ForceTranslateContent;
         runVersion += 1;
         const version = runVersion;
         sourceLanguageCache = undefined;
+        modelIssues.clear();
+        lastModelRecheckAt = -Infinity;
+        modelRecheckPromise = null;
         discoverAndObserveShadowRoots(document);
         startShadowScan();
         await translateNodes(collectAllCandidateNodes(), version);
@@ -454,25 +608,37 @@ var ForceTranslateContent;
         active = false;
         runVersion += 1;
         sourceLanguageCache = undefined;
+        modelIssues.clear();
         stopObservers();
         for (const [node, record] of translations) {
             // React側が既に別文字列へ更新している場合は上書きしない。
-            if (node.isConnected && node.data === record.translated) {
+            if (node.data === record.translated) {
                 node.data = record.original;
             }
         }
         translations.clear();
     }
     function prewarmTranslatorFromGesture(event) {
-        if (!isTopFrame || event.button !== 2 || !("Translator" in globalThis))
+        if (!isTopFrame || !("Translator" in globalThis))
+            return;
+        // 自動翻訳中は通常のクリック・キー操作でもページ側を初期化する。
+        // 右クリックによる手動翻訳の準備は、翻訳開始前にも行う。
+        if (!active && (!(event instanceof MouseEvent) || event.button !== 2))
+            return;
+        if (!navigator.userActivation?.isActive)
             return;
         const declared = normalizeLanguage(document.documentElement.lang);
-        const source = sourceLanguageCache ?? declared;
-        if (!source || source === TARGET_LANGUAGE || translatorPromises.has(source))
-            return;
-        void createTranslatorFromGesture(source).catch((error) => {
-            console.warn("[Force Translate] translator prewarm failed", error);
-        });
+        const sources = new Set([...knownContentLanguages, sourceLanguageCache ?? declared]);
+        for (const source of sources) {
+            if (!source || source === TARGET_LANGUAGE || translatorPromises.has(source))
+                continue;
+            void createTranslatorFromGesture(source).then(() => {
+                if (active)
+                    return translateNodes(collectAllCandidateNodes(), runVersion);
+            }).catch((error) => {
+                console.warn("[Force Translate] translator prewarm failed", error);
+            });
+        }
     }
     async function maybeStartAutoTranslate() {
         if (!isTopFrame)
@@ -501,12 +667,17 @@ var ForceTranslateContent;
             return;
         }
         if (rawMessage.type === "FT_GET_STATUS" && isTopFrame) {
-            void resolveSourceLanguage()
-                .then((sourceLanguage) => {
+            void resolveSourceLanguages()
+                .then(async (sourceLanguages) => {
                 sendResponse({
                     ok: true,
                     active,
-                    sourceLanguage,
+                    sourceLanguage: sourceLanguages[0] ?? await resolvePageSourceLanguage(),
+                    sourceLanguages,
+                    modelIssues: sourceLanguages.flatMap((language) => {
+                        const issue = modelIssues.get(language);
+                        return issue ? [{ language, kind: issue instanceof ActivationRequiredError ? "activation-required" : "unavailable", message: issue.message }] : [];
+                    }),
                     origin: pageOrigin(),
                 });
             })
@@ -515,6 +686,8 @@ var ForceTranslateContent;
                     ok: true,
                     active,
                     sourceLanguage: null,
+                    sourceLanguages: [],
+                    modelIssues: [],
                     origin: pageOrigin(),
                 });
             });
@@ -543,8 +716,13 @@ var ForceTranslateContent;
         // mousedown + contextmenuの両方を見る。ブラウザ/OS差で片方しかactivationを持たない場合に備える。
         window.addEventListener("mousedown", prewarmTranslatorFromGesture, true);
         window.addEventListener("contextmenu", prewarmTranslatorFromGesture, true);
+        window.addEventListener("keydown", prewarmTranslatorFromGesture, true);
+    }
+    if (isDiscord) {
+        // Discordはウィンドウの内側をスクロールするためcaptureで拾う。
+        window.addEventListener("scroll", translateDiscordOnScroll, { capture: true, passive: true });
     }
     // 右クリック前に言語だけ解決しておくと、user gesture中にTranslator.create()を即開始できる。
-    void resolveSourceLanguage().catch(() => undefined);
+    void resolveSourceLanguages().catch(() => undefined);
     void maybeStartAutoTranslate().catch(notifyError);
 })(ForceTranslateContent || (ForceTranslateContent = {}));

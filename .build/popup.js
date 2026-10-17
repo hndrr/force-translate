@@ -30,6 +30,18 @@ var ForceTranslatePopup;
         message.textContent = text;
         message.classList.toggle("error", isError);
     }
+    function setStatusMessage(fallback = "") {
+        const issues = pageStatus?.modelIssues ?? [];
+        if (issues.some((issue) => issue.kind === "activation-required")) {
+            setMessage("一部の翻訳はページでの操作待ちです。ページ内をクリックすると自動で再開します。");
+        }
+        else if (issues.length) {
+            setMessage(issues.map((issue) => issue.message).join("\n"), true);
+        }
+        else {
+            setMessage(fallback);
+        }
+    }
     function setBusy(next) {
         busy = next;
         translateButton.disabled = next || !activeTab?.id || !pageStatus?.sourceLanguage;
@@ -38,7 +50,7 @@ var ForceTranslatePopup;
     }
     function renderStatus(status) {
         pageStatus = status;
-        stateBadge.textContent = status.active ? "翻訳中" : "待機";
+        stateBadge.textContent = status.active ? (status.modelIssues?.length ? "一部保留" : "翻訳中") : "待機";
         stateBadge.classList.toggle("active", status.active);
         translateButton.textContent = status.active ? "翻訳を更新" : "このページを翻訳";
         restoreButton.disabled = busy || !status.active;
@@ -61,32 +73,43 @@ var ForceTranslatePopup;
             throw new Error("現在のタブを取得できません");
         return chrome.tabs.sendMessage(activeTab.id, { type: "FT_GET_STATUS" }, { frameId: 0 });
     }
-    async function prepareTranslatorFromUserClick(sourceLanguage) {
+    async function prepareTranslatorsFromUserClick() {
+        const languages = [...new Set(pageStatus?.sourceLanguages ?? [pageStatus?.sourceLanguage])]
+            .filter((language) => Boolean(language) && language !== TARGET_LANGUAGE);
+        if (!languages.length)
+            return;
         if (!("Translator" in globalThis)) {
             throw new Error("このChromeではTranslator APIを利用できません");
         }
-        if (sourceLanguage === TARGET_LANGUAGE)
-            return;
         progressWrap.hidden = false;
         progressBar.style.width = "0%";
-        progressText.textContent = `${sourceLanguage} → ja の翻訳モデルを準備中…`;
+        progressText.textContent = `${languages.join(" / ")} → ja の翻訳モデルを準備中…`;
+        const progress = new Map(languages.map((language) => [language, 0]));
+        const updateProgress = () => {
+            const percent = Math.round([...progress.values()].reduce((sum, loaded) => sum + loaded, 0) / languages.length * 100);
+            progressBar.style.width = `${percent}%`;
+            progressText.textContent = `翻訳モデルを準備中… ${percent}%`;
+        };
         // この関数はbutton/changeイベントの同期ハンドラから、最初のawaitより前に呼ぶ。
-        // モデル未取得時のuser activationをpopup側で確保する。
-        const translatorPromise = Translator.create({
-            sourceLanguage,
-            targetLanguage: TARGET_LANGUAGE,
-            monitor(monitor) {
-                monitor.addEventListener("downloadprogress", (event) => {
-                    const percent = Math.max(0, Math.min(100, Math.round(event.loaded * 100)));
-                    progressBar.style.width = `${percent}%`;
-                    progressText.textContent = `翻訳モデルを準備中… ${percent}%`;
-                });
-            },
+        // 全言語のcreate()を最初のawaitより前に開始し、user activationを共有する。
+        const preparations = languages.map(async (sourceLanguage) => {
+            const translator = await Translator.create({
+                sourceLanguage,
+                targetLanguage: TARGET_LANGUAGE,
+                monitor(monitor) {
+                    monitor.addEventListener("downloadprogress", (event) => {
+                        progress.set(sourceLanguage, Math.max(0, Math.min(1, event.loaded)));
+                        updateProgress();
+                    });
+                },
+            });
+            translator.destroy?.();
+            progress.set(sourceLanguage, 1);
+            updateProgress();
         });
-        const translator = await translatorPromise;
+        await Promise.all(preparations);
         progressBar.style.width = "100%";
         progressText.textContent = "翻訳モデルの準備完了";
-        translator.destroy?.();
     }
     async function startTranslation() {
         if (!activeTab?.id || !pageStatus?.sourceLanguage)
@@ -94,11 +117,11 @@ var ForceTranslatePopup;
         setBusy(true);
         setMessage("");
         try {
-            const preparation = prepareTranslatorFromUserClick(pageStatus.sourceLanguage);
+            const preparation = prepareTranslatorsFromUserClick();
             await preparation;
             await chrome.tabs.sendMessage(activeTab.id, { type: "FT_START_TRANSLATION" });
             renderStatus(await fetchPageStatus());
-            setMessage("翻訳を開始しました");
+            setStatusMessage("翻訳を開始しました");
         }
         catch (error) {
             setMessage(error instanceof Error ? error.message : String(error), true);
@@ -132,7 +155,7 @@ var ForceTranslatePopup;
         setMessage("");
         try {
             if (enabled) {
-                const preparation = prepareTranslatorFromUserClick(pageStatus.sourceLanguage);
+                const preparation = prepareTranslatorsFromUserClick();
                 await preparation;
                 await setAutoEnabled(pageStatus.origin, true);
                 await chrome.tabs.sendMessage(activeTab.id, { type: "FT_START_TRANSLATION" });
@@ -145,6 +168,7 @@ var ForceTranslatePopup;
                 setMessage("このサイトの自動翻訳をOFFにしました");
             }
             renderStatus(await fetchPageStatus());
+            setStatusMessage(enabled ? "このサイトの自動翻訳をONにしました" : "このサイトの自動翻訳をOFFにしました");
         }
         catch (error) {
             autoToggle.checked = !enabled;
@@ -170,6 +194,7 @@ var ForceTranslatePopup;
             const status = await fetchPageStatus();
             renderStatus(status);
             autoToggle.checked = (await getAutoOrigins()).includes(origin);
+            setStatusMessage();
             setBusy(false);
         }
         catch {
